@@ -8,3 +8,16 @@
   to { transform: translateX(0); }
 }
 .kb-drawer-panel { animation: kb-slide-in 0.18s ease-out; }
+
+/* ── 修复代码块“部分字色与背景相近看不见” ──────────────────────────
+   根因：@tailwindcss/typography 给 pre 的默认变量是深底(#1f2937)+浅字(#e5e7eb)，
+   而 highlight.js/styles/github.css 是浅底深字主题；两者特异性同为 (0,1,0) 时
+   按源顺序后者胜——Tailwind CSS 在 hljs 之后进 bundle，prose 的
+   `background: transparent`（.prose :where(pre code)）顶掉了 hljs 的浅底，
+   于是深色 token（字符串 #032f62 / 注释 #6a737d）落在深底上几乎不可见。
+   修法：把 pre 的两个 prose 变量改回与 github 主题配套的浅色底，
+   特异性 (0,1,1) > 变量定义处的 (0,1,0)，hljs 主题即可正常显色。 */
+.prose pre {
+  --tw-prose-pre-bg: #f6f8fa;   /* 与 github.css 的代码块底色一致 */
+  --tw-prose-pre-code: #24292e; /* github.css 的默认字色 */
+}
