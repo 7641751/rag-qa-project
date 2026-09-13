@@ -1,0 +1,283 @@
+openapi: 3.1.0
+info:
+  title: LangChain 智能问答 API
+  version: 0.1.0
+  description: >
+    CRAG 问答后端契约。核心是 SSE 流式端点 /api/chat/stream；
+    事件协议见其 responses.200.description 与 components.schemas 中的 *Event。
+servers:
+  - url: http://localhost:8000
+    description: 本地后端(开发期由 Vite proxy 转发 /api)
+tags:
+  - name: chat
+    description: 问答与会话
+  - name: kb
+    description: 知识库文档管理
+  - name: system
+    description: 系统探针
+paths:
+  /api/chat/stream:
+    post:
+      tags: [chat]
+      summary: 提问并流式作答(SSE)
+      description: >
+        返回 text/event-stream。帧格式 `event: <type>` 换行 `data: <json>` 换行换行。
+        事件类型: step/token/sources/done/error。
+        成功事件序: 若干 step → 若干 token → sources → done。
+        step 中 retrieve/grade_documents/rewrite_query 在节点完成时发(均在 token 前);
+        generate 步骤可选地在首个 token 前补发。token.text 仅来自 generate 节点。
+        出错: 发 error 后关闭流(不再有 done)。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChatRequest' }
+      responses:
+        '200':
+          description: SSE 事件流(见上)。各事件 schema 见 components.schemas 的 *Event。
+          content:
+            text/event-stream:
+              schema: { type: string }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '503': { $ref: '#/components/responses/KBNotReady' }
+  /api/chat/history:
+    get:
+      tags: [chat]
+      summary: 拉取会话历史
+      description: 新/未知 thread_id 返回 200 + 空 messages(不报 404)。steps 不入历史。
+      parameters:
+        - name: thread_id
+          in: query
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: 历史消息
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HistoryResponse' }
+  /api/health:
+    get:
+      tags: [system]
+      summary: 健康检查
+      responses:
+        '200':
+          description: 服务状态
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+  /api/kb/documents:
+    post:
+      tags: [kb]
+      summary: 上传文档并入库(SSE 进度)
+      description: >
+        返回 text/event-stream。帧格式 `event: <type>` 换行 `data: <json>` 换行换行。
+        事件类型: progress/done/error。
+        成功事件序: progress(saved) → progress(parsed) → progress(split) →
+        progress(embedding)×N → done。出错: 发 error 后关闭流(不再有 done)。
+        白名单 .md/.txt/.pdf，单文件 ≤ 20MB；不合规在流开始前用 HTTP 4xx 拒绝。
+        同名文件视为替换(done.replaced=true)。
+        客户端取消(abort)时后端必须按 doc_id 回滚已写入向量。
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary, description: .md/.txt/.pdf，≤ 20MB }
+      responses:
+        '200':
+          description: SSE 进度流。事件 schema 见 KbProgressEvent/KbDoneEvent/ErrorEvent。
+          content:
+            text/event-stream:
+              schema: { type: string }
+        '413': { $ref: '#/components/responses/FileTooLarge' }
+        '415': { $ref: '#/components/responses/UnsupportedFileType' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    get:
+      tags: [kb]
+      summary: 列出用户上传的文档
+      description: >
+        只返回 origin="upload" 的文档，按 uploaded_at 倒序。
+        空库返回 200 + 空 documents(不报 404)。
+        builtin 为可选摘要，统计不到可整体省略。
+      responses:
+        '200':
+          description: 上传文档列表 + 可选预置摘要
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/KbListResponse' }
+  /api/kb/documents/{doc_id}:
+    delete:
+      tags: [kb]
+      summary: 删除上传文档的全部向量块
+      description: >
+        删除过滤条件必须为 {"$and":[{"doc_id":X},{"origin":"upload"}]}，
+        因此预置文档不可删(过滤为空 → 404)。
+        幂等: 重复删同一 doc_id 第二次返回 404。
+      parameters:
+        - name: doc_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: 删除结果
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/KbDeleteResponse' }
+        '404': { $ref: '#/components/responses/DocNotFound' }
+components:
+  schemas:
+    ChatRequest:
+      type: object
+      required: [question, thread_id]
+      properties:
+        question: { type: string, minLength: 1, maxLength: 4000 }
+        thread_id: { type: string, format: uuid }
+    StepEvent:
+      type: object
+      required: [node, label]
+      properties:
+        node: { type: string, enum: [retrieve, grade_documents, rewrite_query, generate] }
+        label: { type: string, description: 中文短标签(检索/评分/重写/生成) }
+        detail: { type: string, description: 可选摘要(如"召回 8 段") }
+    TokenEvent:
+      type: object
+      required: [text]
+      properties: { text: { type: string } }
+    Source:
+      type: object
+      required: [title]
+      properties:
+        title: { type: string }
+        snippet: { type: string }
+        score: { type: [number, 'null'] }
+    SourcesEvent:
+      type: object
+      required: [sources]
+      properties:
+        sources: { type: array, items: { $ref: '#/components/schemas/Source' } }
+    DoneEvent:
+      type: object
+      required: [thread_id, rewrites, grounded]
+      properties:
+        thread_id: { type: string, format: uuid }
+        rewrites: { type: integer, minimum: 0 }
+        grounded:
+          type: boolean
+          description: >
+            true = 本轮答案有知识库依据；false = 未命中知识库、
+            答案完全来自模型通用知识，前端必须渲染醒目的未验证标识。
+            后端用 bool(final_docs) 确定性得出，不依赖模型自述。
+    ErrorEvent:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string, enum: [VALIDATION_ERROR, RETRIEVAL_ERROR, LLM_ERROR, INTERNAL_ERROR, UNSUPPORTED_FILE_TYPE, FILE_TOO_LARGE, PARSE_ERROR, EMPTY_DOCUMENT, EMBEDDING_ERROR, NOT_FOUND] }
+        message: { type: string }
+    HistoryMessage:
+      type: object
+      required: [role, content]
+      properties:
+        role: { type: string, enum: [user, assistant] }
+        content: { type: string }
+        sources: { type: array, items: { $ref: '#/components/schemas/Source' } }
+        grounded:
+          type: [boolean, 'null']
+          description: >
+            仅 assistant 消息有意义。false = 该回答无知识库依据，刷新后仍应渲染警示标识。
+            需后端把它写进 AIMessage.additional_kwargs["grounded"] 才会返回；未持久化时为 null。
+    HistoryResponse:
+      type: object
+      required: [thread_id, messages]
+      properties:
+        thread_id: { type: string, format: uuid }
+        messages: { type: array, items: { $ref: '#/components/schemas/HistoryMessage' } }
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, example: ok }
+        kb_count: { type: integer }
+        model: { type: string }
+    KbProgressEvent:
+      type: object
+      required: [stage]
+      properties:
+        stage: { type: string, enum: [saved, parsed, split, embedding] }
+        current: { type: [integer, 'null'], description: embedding 阶段必填(已嵌入段数) }
+        total: { type: [integer, 'null'], description: embedding 阶段必填(总段数) }
+        message: { type: string, description: 可读中文短句，前端直接显示 }
+    KbDoneEvent:
+      type: object
+      required: [doc_id, filename, chunks, replaced, uploaded_at]
+      properties:
+        doc_id: { type: string, format: uuid }
+        filename: { type: string }
+        chunks: { type: integer, minimum: 1 }
+        replaced: { type: boolean, description: true 表示同名旧文档已被替换 }
+        uploaded_at: { type: string, format: date-time }
+    KbDocument:
+      type: object
+      required: [doc_id, filename, chunks, uploaded_at]
+      properties:
+        doc_id: { type: string, format: uuid }
+        filename: { type: string }
+        title: { type: string }
+        chunks: { type: integer, minimum: 0 }
+        size_bytes: { type: integer }
+        uploaded_at: { type: string, format: date-time }
+    KbBuiltinSummary:
+      type: object
+      required: [docs, chunks]
+      properties:
+        docs: { type: integer }
+        chunks: { type: integer }
+    KbListResponse:
+      type: object
+      required: [documents]
+      properties:
+        documents: { type: array, items: { $ref: '#/components/schemas/KbDocument' } }
+        builtin: { $ref: '#/components/schemas/KbBuiltinSummary' }
+    KbDeleteResponse:
+      type: object
+      required: [doc_id, filename, deleted_chunks]
+      properties:
+        doc_id: { type: string, format: uuid }
+        filename: { type: string }
+        deleted_chunks: { type: integer, minimum: 0 }
+    ErrorBody:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string }
+        message: { type: string }
+  responses:
+    ValidationError:
+      description: 请求体校验失败
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorBody' }
+    KBNotReady:
+      description: 知识库未就绪
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorBody' }
+    UnsupportedFileType:
+      description: 扩展名不在白名单(.md/.txt/.pdf)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorBody' }
+    FileTooLarge:
+      description: 文件超过 20MB
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorBody' }
+    DocNotFound:
+      description: doc_id 不存在(或指向不可删的预置文档)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorBody' }

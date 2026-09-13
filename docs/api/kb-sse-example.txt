@@ -1,0 +1,17 @@
+event: progress
+data: {"stage":"saved","message":"已接收 report.pdf (1.2 MB)"}
+
+event: progress
+data: {"stage":"parsed","message":"解析出 48210 字符"}
+
+event: progress
+data: {"stage":"split","current":100,"total":100,"message":"切分为 100 段"}
+
+event: progress
+data: {"stage":"embedding","current":10,"total":100,"message":"嵌入 10/100"}
+
+event: progress
+data: {"stage":"embedding","current":100,"total":100,"message":"嵌入 100/100"}
+
+event: done
+data: {"doc_id":"0f0a1b2c-3d4e-4f50-8a6b-7c8d9e0f1a2b","filename":"report.pdf","chunks":100,"replaced":false,"uploaded_at":"2026-09-11T10:23:41Z"}

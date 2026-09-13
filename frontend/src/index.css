@@ -1,0 +1,10 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 知识库抽屉滑入：用原生 keyframes，不引额外动画依赖 */
+@keyframes kb-slide-in {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}
+.kb-drawer-panel { animation: kb-slide-in 0.18s ease-out; }

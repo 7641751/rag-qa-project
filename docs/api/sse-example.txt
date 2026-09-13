@@ -1,0 +1,20 @@
+event: step
+data: {"node":"retrieve","label":"检索","detail":"召回 8 段"}
+
+event: step
+data: {"node":"grade_documents","label":"评分","detail":"相关 6/8"}
+
+event: step
+data: {"node":"generate","label":"生成","detail":"开始作答"}
+
+event: token
+data: {"text":"要切分 markdown，"}
+
+event: token
+data: {"text":"用 RecursiveCharacterTextSplitter.from_language(Language.MARKDOWN, ...)。"}
+
+event: sources
+data: {"sources":[{"title":"01_文档加载与文本分割.md","snippet":"RecursiveCharacterTextSplitter.from_language(...)","score":0.82}]}
+
+event: done
+data: {"thread_id":"550e8400-e29b-41d4-a716-446655440000","rewrites":0,"grounded":true}
