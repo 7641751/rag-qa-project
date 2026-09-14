@@ -1,11 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
 
-const { streamChatMock, fetchHistoryMock } = vi.hoisted(() => ({
-  streamChatMock: vi.fn(), fetchHistoryMock: vi.fn(),
+const { streamChatMock, fetchHistoryMock, deleteThreadMock } = vi.hoisted(() => ({
+  streamChatMock: vi.fn(), fetchHistoryMock: vi.fn(), deleteThreadMock: vi.fn(),
 }));
 vi.mock('../api/client', () => ({
-  streamChat: streamChatMock, fetchHistory: fetchHistoryMock,
+  streamChat: streamChatMock, fetchHistory: fetchHistoryMock, deleteThread: deleteThreadMock,
 }));
 
 import { useChat } from '../hooks/useChat';
@@ -14,7 +14,9 @@ beforeEach(() => {
   localStorage.clear();
   streamChatMock.mockReset();
   fetchHistoryMock.mockReset();
+  deleteThreadMock.mockReset();
   fetchHistoryMock.mockResolvedValue({ thread_id: 't', messages: [] });
+  deleteThreadMock.mockResolvedValue({ thread_id: 't', deleted: true });
 });
 
 describe('useChat', () => {
@@ -119,5 +121,101 @@ describe('useChat', () => {
     await act(async () => { await new Promise(r => setTimeout(r, 0)); });
     const a = result.current.messages[1];
     if (a.role === 'assistant') { expect(a.grounded).toBeUndefined(); }
+  });
+
+  it('流式进行中删除：先 abort 并等流结束，才发 DELETE（顺序是硬约束）', async () => {
+    // 用一个悬着的流：只有 abort 时才 reject（模拟真实 AbortError）
+    const order: string[] = [];
+    let signal: AbortSignal | undefined;
+    streamChatMock.mockImplementation((_b: unknown, h: any) => new Promise<void>((_res, rej) => {
+      signal = h.signal as AbortSignal;
+      signal.addEventListener('abort', () => {
+        order.push('aborted');
+        const e = new Error('Aborted'); e.name = 'AbortError'; rej(e);
+      });
+    }));
+    deleteThreadMock.mockImplementation(async () => {
+      order.push('deleted');
+      return { thread_id: 't', deleted: true };
+    });
+
+    const { result } = renderHook(() => useChat());
+    await act(async () => { await new Promise(r => setTimeout(r, 0)); });
+    act(() => { result.current.send('q'); });                 // 不 await：让流悬着
+    await act(async () => { await new Promise(r => setTimeout(r, 0)); });
+
+    let ok = false;
+    await act(async () => { ok = await result.current.deleteChat(); });
+
+    expect(order).toEqual(['aborted', 'deleted']);            // DELETE 不得早于流结束
+    expect(ok).toBe(true);
+    expect(signal?.aborted).toBe(true);
+  });
+
+  it('删除成功：清空消息、返回 true、deleting 归位', async () => {
+    streamChatMock.mockImplementation(async (_b: unknown, h: any) =>
+      h.onDone({ thread_id: 't', rewrites: 0, grounded: true }));
+    const { result } = renderHook(() => useChat());
+    await act(async () => { await new Promise(r => setTimeout(r, 0)); });
+    await act(async () => { result.current.send('q'); });
+    expect(result.current.messages).toHaveLength(2);
+
+    let ok = false;
+    await act(async () => { ok = await result.current.deleteChat(); });
+
+    expect(ok).toBe(true);
+    expect(result.current.messages).toHaveLength(0);
+    expect(result.current.deleting).toBe(false);
+    expect(result.current.deleteError).toBeNull();
+  });
+
+  it('删除失败：保留消息 + 中文提示 + 返回 false；clearDeleteError 可清', async () => {
+    streamChatMock.mockImplementation(async (_b: unknown, h: any) =>
+      h.onDone({ thread_id: 't', rewrites: 0, grounded: true }));
+    deleteThreadMock.mockRejectedValue(new Error('delete thread HTTP 500'));
+    const { result } = renderHook(() => useChat());
+    await act(async () => { await new Promise(r => setTimeout(r, 0)); });
+    await act(async () => { result.current.send('q'); });
+
+    let ok = true;
+    await act(async () => { ok = await result.current.deleteChat(); });
+
+    expect(ok).toBe(false);
+    expect(result.current.messages).toHaveLength(2);          // 悲观：不清空
+    expect(result.current.deleteError).toBe('删除失败，请重试');
+    expect(result.current.deleting).toBe(false);
+
+    act(() => { result.current.clearDeleteError(); });
+    expect(result.current.deleteError).toBeNull();
+  });
+
+  it('网络层失败(TypeError)提示「无法连接后端」', async () => {
+    deleteThreadMock.mockRejectedValue(new TypeError('Failed to fetch'));
+    const { result } = renderHook(() => useChat());
+    await act(async () => { await new Promise(r => setTimeout(r, 0)); });
+
+    let ok = true;
+    await act(async () => { ok = await result.current.deleteChat(); });
+
+    expect(ok).toBe(false);
+    expect(result.current.deleteError).toBe('无法连接后端');
+  });
+
+  it('deleted:false(幂等)同样清空，且 thread_id 保持不变', async () => {
+    streamChatMock.mockImplementation(async (_b: unknown, h: any) =>
+      h.onDone({ thread_id: 't', rewrites: 0, grounded: true }));
+    deleteThreadMock.mockResolvedValue({ thread_id: 't', deleted: false });
+    const { result } = renderHook(() => useChat());
+    await act(async () => { await new Promise(r => setTimeout(r, 0)); });
+    await act(async () => { result.current.send('q'); });
+    const before = result.current.threadId;
+
+    let ok = false;
+    await act(async () => { ok = await result.current.deleteChat(); });
+
+    expect(ok).toBe(true);
+    expect(result.current.messages).toHaveLength(0);
+    // 与 newChat 语义正交：删除不换 id（spec 决策 8）
+    expect(result.current.threadId).toBe(before);
   });
 });
