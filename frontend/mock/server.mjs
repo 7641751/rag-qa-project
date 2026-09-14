@@ -1,4 +1,4 @@
-// 无真实后端时联调用。启动: npm run mock (监听 :8000，实现全部 6 个端点)
+// 无真实后端时联调用。启动: npm run mock (监听 :8000，实现全部 7 个端点)
 import http from 'node:http';
 
 const PORT = 8000;
@@ -11,6 +11,9 @@ const steps = [
 ];
 const tokens = ['要切分 markdown，', '用 `RecursiveCharacterTextSplitter.from_language', '(Language.MARKDOWN, ...)`。', '它按标题/代码围栏优先切分。'];
 const sources = [{ title: '01_文档加载与文本分割.md', snippet: 'RecursiveCharacterTextSplitter.from_language(...)', score: 0.82 }];
+// 按 thread_id 存历史：让 GET /api/chat/history 与 DELETE /api/chat/threads/{id} 有真实语义。
+// Map.delete() 返回「是否真的删掉了」，恰好就是契约里的 deleted 字段。
+const threads = new Map();
 
 // ---------- 知识库（内存态：可真增真删，让前端全流程自测） ----------
 let documents = [
@@ -47,7 +50,9 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   if (req.method === 'GET' && url.pathname === '/api/chat/history') {
-    json(res, 200, { thread_id: url.searchParams.get('thread_id') ?? '', messages: [] });
+    const tid = url.searchParams.get('thread_id') ?? '';
+    // 未知/已删除的 thread → 200 + 空数组（契约：不报 404）
+    json(res, 200, { thread_id: tid, messages: threads.get(tid) ?? [] });
     return;
   }
   if (req.method === 'POST' && url.pathname === '/api/chat/stream') {
@@ -71,7 +76,26 @@ const server = http.createServer(async (req, res) => {
     res.write(frame('sources', { sources: ungrounded ? [] : sources }));
     await sleep(100);
     res.write(frame('done', { thread_id, rewrites: ungrounded ? 2 : 0, grounded: !ungrounded }));
+    // 记录本轮问答，让 history 与 delete 有真实语义
+    const hist = threads.get(thread_id) ?? [];
+    hist.push({ role: 'user', content: question });
+    hist.push({
+      role: 'assistant',
+      content: ungrounded ? '⚠ 本回答未命中知识库，基于模型通用知识（模拟）。' : tokens.join(''),
+      sources: ungrounded ? [] : sources,
+      grounded: !ungrounded,
+    });
+    threads.set(thread_id, hist);
     res.end();
+    return;
+  }
+
+  // ---------- 聊天: 删除会话（幂等） ----------
+  const delThread = /^\/api\/chat\/threads\/([^/]+)$/.exec(url.pathname);
+  if (req.method === 'DELETE' && delThread) {
+    const id = decodeURIComponent(delThread[1]);
+    // Map.delete 的返回值就是契约的 deleted：本来不存在 → false，仍是 200（幂等，不报 404）
+    json(res, 200, { thread_id: id, deleted: threads.delete(id) });
     return;
   }
 
@@ -145,4 +169,4 @@ const server = http.createServer(async (req, res) => {
   json(res, 404, { code: 'NOT_FOUND', message: 'no route' });
 });
 
-server.listen(PORT, () => console.log(`[mock] SSE 服务已起: http://localhost:${PORT}（6 个端点）`));
+server.listen(PORT, () => console.log(`[mock] SSE 服务已起: http://localhost:${PORT}（7 个端点）`));
