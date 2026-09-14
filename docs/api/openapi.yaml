@@ -56,6 +56,28 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/HistoryResponse' }
+  /api/chat/threads/{thread_id}:
+    delete:
+      tags: [chat]
+      summary: 删除会话的全部 checkpoint(幂等)
+      description: >
+        删除该 thread 在 checkpointer 中的全部 checkpoint 与 write 行，不可恢复。
+        幂等: 未知/已删过的 thread_id 返回 200 + deleted=false(不是 404)。
+        与 KB 的 DELETE(404) 故意不同: doc_id 来自服务端列表，thread_id 由前端本地生成。
+        删除后 GET /api/chat/history 仍返回 200 + 空 messages。
+        同一 thread_id 删除后可继续使用(LangGraph 会自动重建)。
+      parameters:
+        - name: thread_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: 删除结果。deleted=false 表示本来就不存在(幂等，非错误)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ChatDeleteResponse' }
+        '422': { $ref: '#/components/responses/ValidationError' }
   /api/health:
     get:
       tags: [system]
@@ -196,6 +218,16 @@ components:
       properties:
         thread_id: { type: string, format: uuid }
         messages: { type: array, items: { $ref: '#/components/schemas/HistoryMessage' } }
+    ChatDeleteResponse:
+      type: object
+      required: [thread_id, deleted]
+      properties:
+        thread_id: { type: string, format: uuid }
+        deleted:
+          type: boolean
+          description: >
+            删除前该 thread 是否存在至少一个 checkpoint。false = 本来就不存在(幂等，非错误)。
+            后端需先用 checkpointer.get_tuple(config) 探测，因为 delete_thread 返回 None。
     Health:
       type: object
       required: [status]

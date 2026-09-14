@@ -1,4 +1,4 @@
-@# LangChain 智能问答 API 契约
+# LangChain 智能问答 API 契约
 
 CRAG（纠错式检索增强）问答后端的接口契约。前端（`frontend/`）与后端（用户实现的 FastAPI）**以本文档 + `openapi.yaml` 为唯一真相源**：任何字段/事件变更，先改这里再改代码。
 
@@ -14,6 +14,7 @@ CRAG（纠错式检索增强）问答后端的接口契约。前端（`frontend/
 |---|---|---|---|
 | `POST` | `/api/chat/stream` | 提问并流式作答 | `text/event-stream` |
 | `GET` | `/api/chat/history` | 拉取会话历史（`?thread_id=`） | `application/json` |
+| `DELETE` | `/api/chat/threads/{thread_id}` | 删除会话的全部服务端状态（幂等） | `application/json` |
 | `POST` | `/api/kb/documents` | 上传文档并入库（SSE 进度） | `text/event-stream` |
 | `GET` | `/api/kb/documents` | 列出用户上传的文档 | `application/json` |
 | `DELETE` | `/api/kb/documents/{doc_id}` | 删除上传文档的全部向量块 | `application/json` |
@@ -169,6 +170,64 @@ data: {"thread_id":"550e8400-e29b-41d4-a716-446655440000","rewrites":2,"grounded
 - `step`（推理步骤）是瞬时的，**不进 history**。
 - **新 / 未知 `thread_id` → `200` + 空 `messages`**（不报 404，新建会话本就无历史）。
 - 后端实现提示：`graph.get_state(config={"configurable": {"thread_id": ...}}).values["messages"]` 映射为上述结构。
+
+---
+
+## DELETE /api/chat/threads/{thread_id}
+
+删除一个会话在服务端的全部状态：LangGraph checkpointer 里该 `thread_id` 的**所有 checkpoint 与 write 行**。**不可恢复**。
+
+**Path 参数**：`thread_id`（必填，uuid）。
+
+**响应** `200 application/json`：
+```json
+{ "thread_id": "550e8400-e29b-41d4-a716-446655440000", "deleted": true }
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `thread_id` | string | ✅ | 回显请求路径中的 id |
+| `deleted` | boolean | ✅ | **删除前**该 thread 是否存在至少一个 checkpoint。`false` = 本来就不存在 |
+
+**幂等语义（与 KB 的 DELETE 故意不同）**：
+
+- 未知 / 已删过的 `thread_id` → **`200` + `{"deleted": false}`**，**不是 `404`**。
+- 为什么与 `DELETE /api/kb/documents/{doc_id}`（返回 404）不同：**id 的来源不同**。KB 的 `doc_id` 来自**服务端列表**，列表里有却删不到 = 真异常，404 有意义；而 `thread_id` 由**前端本地随机生成**（`crypto.randomUUID()`），清 localStorage、换浏览器、多标签页重复点都会导致「不存在」，404 会变成噪音。DELETE 本身也是幂等方法。
+
+**错误**：
+
+| HTTP | code | 触发条件 |
+|---|---|---|
+| `422` | `VALIDATION_ERROR` | 仅当后端把 `thread_id` 声明为 `UUID` 类型且格式非法时。**建议后端用 `str`**（与 `GET /api/chat/history` 一致），此时 422 实际不会发生 |
+| `500` | `INTERNAL_ERROR` | 数据库异常等服务端错误 |
+
+**副作用与既有约定的关系**：
+
+- 删除后 `GET /api/chat/history?thread_id=<已删的id>` 仍返回 `200 {"messages": []}`，**不是 404**（延续「新 / 未知 `thread_id` → 200 + 空 `messages`」的既有约定）。
+- 同一个 `thread_id` 删除后**可以继续使用**：再次提问时 LangGraph 会自动重建该 thread 的 checkpoint。因此前端删除后**不需要换 `thread_id`**。
+
+**后端实现提示**：
+
+- `checkpointer.delete_thread(thread_id)` 返回 `None`，拿不到「是否真删了」，所以要**先探测再删**：`existed = checkpointer.get_tuple(config) is not None`，然后 `delete_thread(...)`，`deleted = existed`。
+- SQLite 操作是阻塞的，async 路由里用 `asyncio.to_thread(...)` 包一层，别卡住事件循环。
+- 官方依据：`data/langchain_docs/langgraph/add-memory.md:1691-1696`「Delete all checkpoints for a thread」；接口规范见 `checkpointers.md:544-546`（checkpoint 行与 write 行都必须删）。
+- ⚠ 别调 `prune` / `copy_thread` / `delete_for_runs`：`InMemorySaver` 4.2.0 **没有实现**它们，基类直接 `raise NotImplementedError`。
+
+**curl 自测**：
+```bash
+# 1) 删除一个有历史的会话
+curl -i -X DELETE http://localhost:8000/api/chat/threads/550e8400-e29b-41d4-a716-446655440000
+# HTTP/1.1 200 OK
+# {"thread_id":"550e8400-e29b-41d4-a716-446655440000","deleted":true}
+
+# 2) 再删一次 —— 幂等，仍是 200
+curl -s -X DELETE http://localhost:8000/api/chat/threads/550e8400-e29b-41d4-a716-446655440000
+# {"thread_id":"550e8400-e29b-41d4-a716-446655440000","deleted":false}
+
+# 3) 删除后查历史 —— 200 + 空数组，不是 404
+curl -s "http://localhost:8000/api/chat/history?thread_id=550e8400-e29b-41d4-a716-446655440000"
+# {"thread_id":"550e8400-e29b-41d4-a716-446655440000","messages":[]}
+```
 
 ---
 
