@@ -1,5 +1,5 @@
 import type {
-  ChatRequest, StreamHandlers, HistoryResponse, Health,
+  ChatRequest, StreamHandlers, HistoryResponse, Health, ChatDeleteResponse,
   StepEvent, TokenEvent, SourcesEvent, DoneEvent, ErrorEvent, ErrorCode,
   KbStreamHandlers, KbProgressEvent, KbDoneEvent, KbListResponse, KbDeleteResponse,
 } from './types';
@@ -142,6 +142,15 @@ export async function fetchHistory(threadId: string): Promise<HistoryResponse> {
   const res = await fetch(`${API_BASE}/chat/history?thread_id=${encodeURIComponent(threadId)}`);
   if (!res.ok) throw new Error(`history HTTP ${res.status}`);
   return (await res.json()) as HistoryResponse;
+}
+
+/** DELETE /api/chat/threads/{thread_id} → 删除该会话在服务端的全部 checkpoint。
+ *  契约规定未知 id 也返 200（deleted:false 表示本来就没有），所以非 2xx 一律是真失败，
+ *  直接 throw 交给调用方（useChat.deleteChat 会转成中文提示）。 */
+export async function deleteThread(threadId: string): Promise<ChatDeleteResponse> {
+  const res = await fetch(`${API_BASE}/chat/threads/${encodeURIComponent(threadId)}`, { method: 'DELETE' });
+  if (!res.ok) throw new Error(`delete thread HTTP ${res.status}`);
+  return (await res.json()) as ChatDeleteResponse;
 }
 
 /** GET /api/health → 健康状态 */

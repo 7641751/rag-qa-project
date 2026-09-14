@@ -16,6 +16,8 @@ export type HistoryRole = 'user' | 'assistant';
 /** grounded 可选：后端未把它持久化进 AIMessage.additional_kwargs 时为 null/缺失 */
 export interface HistoryMessage { role: HistoryRole; content: string; sources?: Source[]; grounded?: boolean | null; }
 export interface HistoryResponse { thread_id: string; messages: HistoryMessage[]; }
+/** DELETE /api/chat/threads/{id} 的响应。deleted=false 表示本来就不存在（幂等，非错误）。 */
+export interface ChatDeleteResponse { thread_id: string; deleted: boolean; }
 export interface Health { status: string; kb_count?: number; model?: string; }
 export interface StreamHandlers {
   onStep?: (e: StepEvent) => void;

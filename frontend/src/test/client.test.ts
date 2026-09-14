@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { parseSSEFrame, splitFrames, streamChat, uploadDocument, fetchDocuments, deleteDocument } from '../api/client';
+import { parseSSEFrame, splitFrames, streamChat, uploadDocument, fetchDocuments, deleteDocument, deleteThread } from '../api/client';
 import type { StepEvent, TokenEvent, DoneEvent, ErrorEvent, KbProgressEvent, KbDoneEvent } from '../api/types';
 
 function mockStream(chunks: string[], init: { ok?: boolean; status?: number; body?: string } = {}) {
@@ -141,5 +141,42 @@ describe('fetchDocuments / deleteDocument', () => {
   it('deleteDocument 非 2xx 抛错', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 404 } as unknown as Response));
     await expect(deleteDocument('nope')).rejects.toThrow(/404/);
+  });
+});
+
+describe('deleteThread', () => {
+  it('用 DELETE 方法并把 thread_id 编进路径', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true, json: async () => ({ thread_id: 't1', deleted: true }),
+    } as unknown as Response);
+    vi.stubGlobal('fetch', fetchMock);
+
+    const r = await deleteThread('t1');
+
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe('/api/chat/threads/t1');
+    expect(init).toEqual({ method: 'DELETE' });
+    expect(r).toEqual({ thread_id: 't1', deleted: true });
+  });
+
+  it('对含特殊字符的 id 做 URL 编码', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true, json: async () => ({ thread_id: 'a/b', deleted: false }),
+    } as unknown as Response);
+    vi.stubGlobal('fetch', fetchMock);
+
+    await deleteThread('a/b');
+
+    expect(fetchMock.mock.calls[0]![0]).toBe('/api/chat/threads/a%2Fb');
+  });
+
+  it('deleted:false 也是成功(幂等)，非 2xx 才抛错', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true, json: async () => ({ thread_id: 't1', deleted: false }),
+    } as unknown as Response));
+    await expect(deleteThread('t1')).resolves.toEqual({ thread_id: 't1', deleted: false });
+
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 500 } as unknown as Response));
+    await expect(deleteThread('t1')).rejects.toThrow(/500/);
   });
 });
