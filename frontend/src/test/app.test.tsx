@@ -1,14 +1,16 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
 
-const { streamChatMock, fetchHistoryMock, uploadDocumentMock, fetchDocumentsMock, deleteDocumentMock } = vi.hoisted(() => ({
+const { streamChatMock, fetchHistoryMock, uploadDocumentMock, fetchDocumentsMock, deleteDocumentMock, deleteThreadMock } = vi.hoisted(() => ({
   streamChatMock: vi.fn(), fetchHistoryMock: vi.fn(),
   uploadDocumentMock: vi.fn(), fetchDocumentsMock: vi.fn(), deleteDocumentMock: vi.fn(),
+  deleteThreadMock: vi.fn(),
 }));
-// ⚠ App 现在也依赖 KB 三个函数；mock 工厂必须全部提供，否则挂载即 TypeError
+// ⚠ App 依赖 client 的全部导出（聊天 3 + KB 3）；mock 工厂必须全部提供，否则挂载即 TypeError
 vi.mock('../api/client', () => ({
   streamChat: streamChatMock,
   fetchHistory: fetchHistoryMock,
+  deleteThread: deleteThreadMock,
   uploadDocument: uploadDocumentMock,
   fetchDocuments: fetchDocumentsMock,
   deleteDocument: deleteDocumentMock,
@@ -26,6 +28,8 @@ beforeEach(() => {
   uploadDocumentMock.mockReset();
   fetchDocumentsMock.mockReset();
   deleteDocumentMock.mockReset();
+  deleteThreadMock.mockReset();
+  deleteThreadMock.mockResolvedValue({ thread_id: 't', deleted: true });
   fetchHistoryMock.mockResolvedValue({ thread_id: 't', messages: [] });
   fetchDocumentsMock.mockResolvedValue({ documents: [], builtin: { docs: 88, chunks: 2885 } });
 });
@@ -79,5 +83,54 @@ describe('App 集成', () => {
     fireEvent.keyDown(window, { key: 'Escape' });                       // 关抽屉
     await waitFor(() => expect(screen.queryByTestId('upload-zone')).not.toBeInTheDocument());
     expect(screen.getByTestId('kb-badge')).toHaveTextContent('1');       // 角标仍在：状态住 App 层
+  });
+
+  /** 发一条消息并等它完成，让删除按钮从禁用变可用 */
+  async function askOnce(question = '什么是 LangChain') {
+    streamChatMock.mockImplementation(async (_b: unknown, h: any) => {
+      h.onToken({ text: '你好' });
+      h.onDone({ thread_id: 't', rewrites: 0, grounded: true });
+    });
+    fireEvent.change(screen.getByPlaceholderText('输入问题…'), { target: { value: question } });
+    fireEvent.click(screen.getByText('发送'));
+    await waitFor(() => expect(screen.getByText(question)).toBeInTheDocument());
+  }
+
+  it('空会话时删除按钮禁用，发一条消息后启用', async () => {
+    render(<App />);
+    await flush();
+    expect(screen.getByTestId('btn-delete-chat')).toBeDisabled();
+    await askOnce();
+    await waitFor(() => expect(screen.getByTestId('btn-delete-chat')).not.toBeDisabled());
+  });
+
+  it('点删除 → 弹窗 → 确认 → 调 DELETE、消息清空、弹窗关闭', async () => {
+    render(<App />);
+    await flush();
+    await askOnce('待删的问题');
+    expect(screen.queryByTestId('confirm-dialog')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId('btn-delete-chat'));
+    await waitFor(() => expect(screen.getByTestId('confirm-dialog')).toBeInTheDocument());
+    expect(screen.getByTestId('confirm-cancel')).toHaveFocus();      // 安全默认：焦点在取消
+
+    fireEvent.click(screen.getByTestId('confirm-ok'));
+    await waitFor(() => expect(deleteThreadMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.queryByTestId('confirm-dialog')).not.toBeInTheDocument());
+    expect(screen.queryByText('待删的问题')).not.toBeInTheDocument();  // 消息已清
+  });
+
+  it('删除失败时弹窗保持打开、显示错误行、消息不清空', async () => {
+    deleteThreadMock.mockRejectedValue(new Error('delete thread HTTP 500'));
+    render(<App />);
+    await flush();
+    await askOnce('不能丢的问题');
+
+    fireEvent.click(screen.getByTestId('btn-delete-chat'));
+    fireEvent.click(screen.getByTestId('confirm-ok'));
+
+    await waitFor(() => expect(screen.getByTestId('confirm-error')).toHaveTextContent('删除失败，请重试'));
+    expect(screen.getByTestId('confirm-dialog')).toBeInTheDocument();     // 没关，可重试
+    expect(screen.getByText('不能丢的问题')).toBeInTheDocument();          // 悲观：消息保留
   });
 });
