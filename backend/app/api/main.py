@@ -1,15 +1,32 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from backend.app.api.errors import register_error_handlers
+from backend.tools.mysql_db_tools import init_db, aclose_db
+
 from config import settings
 from backend.app.agent.schemas import Health
+from backend.app.api import auth_router, chat_router, kb_router
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    # 启动：异步 checkpointer 依赖事件循环，首个请求时惰性构造，无需预热
+    await init_db()
+    yield
+    from backend.app.agent.graph import aclose_checkpointer
+    await aclose_db()  # 引擎 dispose + **成对**清空两个 lru_cache
+    await aclose_checkpointer()
 
 
 app = FastAPI(
     title="LangChain Knowledge Helper Backend",
     description="MVP backend for the intelligent knowledge helper.",
     version="0.1.0",
+    lifespan=lifespan,
 )
+register_error_handlers(app)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -27,7 +44,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from backend.app.api import chat_router, kb_router
 
 @app.get("/api/health", response_model=Health,
          response_model_exclude_none=True, tags=["system"])
@@ -47,5 +63,7 @@ def health_check():
 
 
 
+
 app.include_router(chat_router.router)
 app.include_router(kb_router.router)
+app.include_router(auth_router.router)
