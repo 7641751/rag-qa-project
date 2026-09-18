@@ -1,11 +1,11 @@
 from typing import TypedDict, Annotated
 
 from langgraph.graph import add_messages
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 """agent 相关的 Schema"""
 
-
+BCRYPT_MAX_BYTES = 72
 # ---------- 状态 ----------
 class RAGState(TypedDict):
     question: str
@@ -54,10 +54,50 @@ class HistoryResponse(BaseModel):
     messages: list[HistoryMessage]   # ✅ 普通 Pydantic 列表
 
 
+class ChatDeleteResponse(BaseModel):
+    """删除会话响应（契约 components.schemas.ChatDeleteResponse）。"""
+    thread_id: str = Field(description="被删除的会话 ID")
+    deleted: bool = Field(
+        description="删除前该 thread 是否存在至少一个 checkpoint。"
+                    "false = 本来就不存在（幂等，非错误）")
+
+
 class Health(BaseModel):
     """系统健康检查响应（契约 components.schemas.Health）。"""
     status: str = Field(description="服务状态，正常为 ok")
     kb_count: int | None = Field(default=None, description="知识库向量条数；读不到则省略")
     model: str | None = Field(default=None, description="当前嵌入模型名")
 
+class Auth(BaseModel):
+    """注册 / 登录请求体（契约 components.schemas.RegisterRequest 与 LoginRequest 同形）。"""
+    username: str = Field(
+        description="用户名", min_length=3, max_length=32, pattern="^[A-Za-z0-9_]+$")
+    password: str = Field(description="密码", min_length=8)
 
+    @field_validator("password")
+    @classmethod
+    def _password_within_bcrypt_limit(cls, v: str) -> str:
+        """schema 层拦超长密码：让 422 由 pydantic 产生、错误定位到 password 字段本身。
+
+        第二层防护在 security.hash_password（同样 72 字节 → 422 VALIDATION_ERROR），
+        **两层都保留**：本模型只管 HTTP 请求体，而 hash_password 还会被
+        改密码 / 重置密码等不经过本模型的路径调用，那时没有 schema 兜底。
+        """
+        n = len(v.encode("utf-8"))
+        if n > BCRYPT_MAX_BYTES:
+            raise ValueError(
+                f"密码 UTF-8 编码后不能超过 {BCRYPT_MAX_BYTES} 字节（当前 {n} 字节）")
+        return v
+
+
+class AuthUser(BaseModel):
+    """鉴权响应里的用户信息（契约 components.schemas.AuthUser）。"""
+    id: int = Field(description="用户 ID")
+    username: str = Field(description="用户名")
+
+
+class LoginResponse(BaseModel):
+    """登录成功响应（契约 components.schemas.LoginResponse）。"""
+    access_token: str = Field(description="JWT")
+    token_type: str = Field(default="bearer", description="固定 bearer（OAuth2 惯例）")
+    user: AuthUser = Field(description="登录用户")
