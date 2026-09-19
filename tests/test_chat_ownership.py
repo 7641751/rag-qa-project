@@ -32,7 +32,7 @@ from backend.app.models import Base, Conversation
 from backend.app.services import chat_service
 from backend.tools import security as sec
 from backend.tools.mysql_db_tools import get_db_session
-from test_graph import FakeRAGModel, FakeRetriever      # 复用既有假件，避免重复实现
+from test_graph import FakeRAGModel, FakeVectorStore    # 复用既有假件，避免重复实现
 
 
 # ============================ 测试替身（Fakes） ============================
@@ -63,7 +63,7 @@ def fake_graph(monkeypatch):
     每个用例里都是干净的（InMemorySaver 随 fixture 重建）。
     """
     graph = build_graph(model=FakeRAGModel(responses=[], relevance_mode="all"),
-                        retriever=FakeRetriever(), checkpointer=InMemorySaver())
+                        vectorstore=FakeVectorStore(), checkpointer=InMemorySaver())
     monkeypatch.setattr(chat_service, "get_graph", lambda: graph)
     return graph
 

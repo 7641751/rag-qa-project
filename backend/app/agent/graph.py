@@ -8,20 +8,21 @@
                 重写次数用尽   -> generate（无资料：放开自由度，用模型自有知识作答并自我声明）
 
 设计要点：
-- build_graph(model=None, retriever=None, checkpointer=None) 支持依赖注入，
-  测试时可传入 FakeChatModel / 内存检索器，零 API 额度跑通全图。
+- build_graph(model=None, vectorstore=None, checkpointer=None) 支持依赖注入，
+  测试时可传入 FakeChatModel / 内存向量库，零 API 额度跑通全图。
 - 每个节点是纯函数：输入状态 -> 输出增量更新。
 """
-import aiosqlite
+from functools import lru_cache
 
+import aiosqlite
 from langchain_chroma import Chroma
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from config import settings
 from backend.app.agent.schemas import RAGState, GradeDocuments, RewrittenQuery
-from functools import lru_cache
+from config import settings
+
 
 # ---------- 工厂 ----------
 def get_model():
@@ -29,10 +30,6 @@ def get_model():
     return ChatDeepSeek(model=settings.deepseek_model,
                         temperature=settings.temperature,
                         streaming=True)
-
-
-def get_retriever():
-    return get_vectorstore().as_retriever(search_kwargs={"k": settings.top_k})
 
 
 @lru_cache(maxsize=1)
@@ -49,6 +46,7 @@ def get_vectorstore():
         embedding_function=build_embeddings(),
         persist_directory=str(settings.chroma_dir),
     )
+
 
 @lru_cache(maxsize=1)
 def get_checkpointer() -> AsyncSqliteSaver:
@@ -78,6 +76,32 @@ async def aclose_checkpointer() -> None:
     if get_checkpointer.cache_info().currsize:
         await get_checkpointer().conn.close()
         get_checkpointer.cache_clear()
+
+
+def kb_filter(user_id: int | None) -> dict | None:
+    """检索范围：预置官方文档全局共享 + 本人上传件。
+
+    预置文档在 ingest.py 里统一打了 `kb="langchain_docs"`，**没有 `origin` 字段**
+    （`upload_function_tools.py:12-16` 与 `docs/api/README.md` 都明写了这一点）。
+    用 `kb` 而不是 `origin` 区分两类文档是本设计的正确做法——若写成
+    `{"$or":[{"origin":"builtin"}, ...]}`，88 篇官方文档会全部从检索结果里消失，
+    且**不报任何错**（问答质量断崖下跌但无人察觉）。
+    tests/test_graph.py::test_kb_filter_never_uses_origin_builtin 钉住了这一点。
+
+    ⚠ Chroma 的 $and / $or **至少要两个子条件**，单条件包一层会抛 ValueError
+      （upload_function_tools.py:17-18、项目 README:438）。所以无 user_id 时
+      直接返回裸条件，不能写 {"$or": [{"kb": BUILTIN_KB}]}。
+
+    ⚠ BUILTIN_KB 必须**函数内 import**：upload_function_tools 反过来 import 本模块的
+      get_vectorstore（它 :29），模块顶层 import 会立刻成环——实测后果是
+      「cannot import name 'get_vectorstore' from partially initialized module」，
+      5 个测试文件连收集都失败。
+    """
+    from backend.tools.upload_function_tools import BUILTIN_KB
+
+    if user_id is None:  # CLI run.py 等无登录态的调用方：只检索预置文档
+        return {"kb": BUILTIN_KB}
+    return {"$or": [{"kb": BUILTIN_KB}, {"user_id": user_id}]}
 
 
 # ---------- 提示词 ----------
@@ -121,11 +145,12 @@ def _recent_dialogue(state: RAGState, limit: int = 4, chars: int = 200) -> str:
 
 
 # ---------- 节点 ----------
-def _make_nodes(model, retriever):
-    """闭包工厂：把 model / retriever 注入节点函数。"""
+def _make_nodes(model, vectorstore):
+    """闭包工厂：把 model / vectorstore 注入节点函数。"""
 
     def retrieve(state: RAGState):
-        docs = retriever.invoke(state["question"])
+        docs = vectorstore.similarity_search(state["question"], k=settings.top_k,
+                                             filter=kb_filter(state.get("user_id")))
         print(f"    [retrieve] 命中 {len(docs)} 段: "
               f"{[d.metadata.get('title', '?') for d in docs]}")
         return {"documents": docs}
@@ -229,13 +254,13 @@ def _decide_to_generate(state: RAGState):
     return "generate"  # 兜底：generate 无资料时会用模型自有知识作答（grounded=False）
 
 
-def build_graph(model=None, retriever=None, checkpointer=None):
-    """构建并编译 RAG 工作流。model/retriever/checkpointer 可注入用于测试。"""
+def build_graph(model=None, vectorstore=None, checkpointer=None):
+    """构建并编译 RAG 工作流。model/vectorstore/checkpointer 可注入用于测试。"""
     from langgraph.graph import END, START, StateGraph
 
     model = model or get_model()
-    retriever = retriever or get_retriever()
-    retrieve, grade, rewrite, generate = _make_nodes(model, retriever)
+    vectorstore = vectorstore or get_vectorstore()
+    retrieve, grade, rewrite, generate = _make_nodes(model, vectorstore)
 
     b = StateGraph(RAGState)
     b.add_node("retrieve", retrieve)

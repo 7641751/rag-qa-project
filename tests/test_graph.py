@@ -92,8 +92,14 @@ class FakeRAGModel(FakeMessagesListChatModel):
         return reply(self.answer_text)     # generate 调用
 
 
-class FakeRetriever:
-    """内存检索器：返回固定的 langchain 文档片段，并记录每次被调用的查询。"""
+class FakeVectorStore:
+    """内存向量库替身：返回固定的 langchain 文档片段，并**记录每次调用收到的 filter**。
+
+    P3 起 `retrieve` 节点直接调 vectorstore.similarity_search（不再是 retriever.invoke），
+    这不是换汤不换药 —— 旧的 FakeRetriever 只有 invoke(query)，**根本看不见 filter**，
+    所以「按用户隔离」这件事在 P1/P2 时期完全无法测试。calls 记下 filter 之后，
+    才能断言 {"$or":[{"kb":...},{"user_id":7}]} 这种隔离语义。
+    """
 
     def __init__(self, docs=None):
         self.docs = list(docs) if docs is not None else [
@@ -106,11 +112,11 @@ class FakeRetriever:
                              "并按消息 id 自动去重/覆盖。",
                 metadata={"title": "Messages", "source": "langchain/messages.md"}),
         ]
-        self.calls: list = []
+        self.calls: list[dict] = []
 
-    def invoke(self, query: str, **kwargs):
-        self.calls.append(query)
-        return list(self.docs)
+    def similarity_search(self, query: str, k: int = 4, filter=None, **kwargs):
+        self.calls.append({"query": query, "k": k, "filter": filter})
+        return list(self.docs)[:k]
 
 
 @pytest.fixture
@@ -128,7 +134,7 @@ def _model(**kwargs) -> FakeRAGModel:
 # ============================ 1. 图结构 ============================
 def test_graph_compiles_with_all_nodes():
     """图能成功编译，且包含 retrieve / grade / rewrite / generate 四个节点。"""
-    app = build_graph(model=_model(), retriever=FakeRetriever(), checkpointer=InMemorySaver())
+    app = build_graph(model=_model(), vectorstore=FakeVectorStore(), checkpointer=InMemorySaver())
     assert app is not None
     node_names = set(app.get_graph().nodes)
     assert {"retrieve", "grade_documents", "rewrite_query", "generate"} <= node_names
@@ -137,19 +143,20 @@ def test_graph_compiles_with_all_nodes():
 # ============================ 2. 端到端路由 ============================
 def test_happy_path_all_relevant(base_state):
     """全部相关 -> 检索一次即直答，不触发改写。"""
-    retriever = FakeRetriever()
-    app = build_graph(model=_model(relevance_mode="all"), retriever=retriever, checkpointer=InMemorySaver())
+    vs = FakeVectorStore()
+    app = build_graph(model=_model(relevance_mode="all"), vectorstore=vs, checkpointer=InMemorySaver())
     result = app.invoke(base_state, config={"configurable": {"thread_id": "test"}, "recursion_limit": 20})
 
     assert result["rewrites"] == 0
     assert len(result["documents"]) == 2
     assert "模拟回答" in result["generation"]
-    assert retriever.calls == [base_state["question"]]   # 只检索了一次
+    # calls 现在记的是 {query,k,filter} 字典，取 query 比对
+    assert [c["query"] for c in vs.calls] == [base_state["question"]]   # 只检索了一次
 
 
 def test_partial_relevance_keeps_only_relevant(base_state):
     """部分相关 -> grade 只保留判为相关的文档，仍然直答。"""
-    app = build_graph(model=_model(relevance_mode="first"), retriever=FakeRetriever(), checkpointer=InMemorySaver())
+    app = build_graph(model=_model(relevance_mode="first"), vectorstore=FakeVectorStore(), checkpointer=InMemorySaver())
     result = app.invoke(base_state, config={"configurable": {"thread_id": "test"}, "recursion_limit": 20})
 
     assert [d.metadata["title"] for d in result["documents"]] == ["Persistence"]
@@ -159,25 +166,25 @@ def test_partial_relevance_keeps_only_relevant(base_state):
 
 def test_rewrite_then_hit(base_state):
     """先判不相关 -> 改写 -> 再检索命中 -> 正常作答（恢复路径）。"""
-    retriever = FakeRetriever()
-    app = build_graph(model=_model(relevance_mode="after_rewrite"), retriever=retriever, checkpointer=InMemorySaver())
+    vs = FakeVectorStore()
+    app = build_graph(model=_model(relevance_mode="after_rewrite"), vectorstore=vs, checkpointer=InMemorySaver())
     result = app.invoke(base_state, config={"configurable": {"thread_id": "test"}, "recursion_limit": 20})
 
     assert result["rewrites"] == 1
     assert len(result["documents"]) == 2
     assert "模拟回答" in result["generation"]
-    assert len(retriever.calls) == 2   # 初次 + 改写后各一次
+    assert len(vs.calls) == 2   # 初次 + 改写后各一次
 
 
 def test_rewrite_exhausted_falls_back(base_state):
     """始终不相关 -> 改写到 max_rewrites 上限 -> 兜底改为用模型自有知识作答（不再硬拒答）。"""
-    retriever = FakeRetriever()
-    app = build_graph(model=_model(relevance_mode="none"), retriever=retriever, checkpointer=InMemorySaver())
+    vs = FakeVectorStore()
+    app = build_graph(model=_model(relevance_mode="none"), vectorstore=vs, checkpointer=InMemorySaver())
     result = app.invoke(base_state, config={"configurable": {"thread_id": "test"}, "recursion_limit": 20})
 
     assert result["rewrites"] == settings.max_rewrites
     assert result["documents"] == []
-    assert len(retriever.calls) == settings.max_rewrites + 1
+    assert len(vs.calls) == settings.max_rewrites + 1
     # 兜底现在会真调用 model：generation 是模型产出，不再是硬编码的「未找到」
     assert "模拟回答" in result["generation"]
     # 且必须把 grounded=False 持久化到 AIMessage，否则刷新后警示标识丢失
@@ -188,7 +195,7 @@ def test_rewrite_exhausted_falls_back(base_state):
 # ============================ 3. 节点单元 ============================
 def test_node_retrieve(base_state):
     """retrieve：把检索结果写入 documents。"""
-    retrieve, _, _, _ = _make_nodes(_model(), FakeRetriever())
+    retrieve, _, _, _ = _make_nodes(_model(), FakeVectorStore())
     out = retrieve(base_state)
 
     assert len(out["documents"]) == 2
@@ -199,7 +206,7 @@ def test_node_grade_filters():
     """grade_documents：按相关性列表过滤文档，只留下判为相关的。"""
     docs = [Document(page_content="a", metadata={"title": "A"}),
             Document(page_content="b", metadata={"title": "B"})]
-    _, grade, _, _ = _make_nodes(_model(relevance_mode="first"), FakeRetriever())
+    _, grade, _, _ = _make_nodes(_model(relevance_mode="first"), FakeVectorStore())
     out = grade({"question": "q", "documents": docs, "generation": "", "rewrites": 0})
 
     assert [d.metadata["title"] for d in out["documents"]] == ["A"]
@@ -208,7 +215,7 @@ def test_node_grade_filters():
 def test_node_rewrite_updates_state():
     """rewrite_query：替换 question 并使 rewrites 计数 +1。"""
     model = _model()
-    _, _, rewrite, _ = _make_nodes(model, FakeRetriever())
+    _, _, rewrite, _ = _make_nodes(model, FakeVectorStore())
     out = rewrite({"question": "原始问题", "documents": [], "generation": "", "rewrites": 0})
 
     assert out["question"] == model.rewrite_to
@@ -221,7 +228,7 @@ def test_node_generate_empty_documents(base_state):
     旧行为是返回硬编码的「未找到」且不调用 model——那会让 stream_mode="messages"
     拿不到任何 AIMessageChunk，前端收到 0 帧 token、答案气泡空白。
     """
-    _, _, _, generate = _make_nodes(_model(), FakeRetriever())
+    _, _, _, generate = _make_nodes(_model(), FakeVectorStore())
     out = generate({**base_state, "documents": []})
 
     assert "模拟回答" in out["generation"]                 # 真的调用了 model
@@ -233,7 +240,7 @@ def test_node_generate_empty_documents(base_state):
 def test_node_generate_uses_context(base_state):
     """generate：有文档时拼接上下文并调用 LLM 产出答案。"""
     docs = [Document(page_content="LangGraph 持久化状态。", metadata={"title": "Persistence"})]
-    _, _, _, generate = _make_nodes(_model(), FakeRetriever())
+    _, _, _, generate = _make_nodes(_model(), FakeVectorStore())
     out = generate({**base_state, "documents": docs})
 
     assert "模拟回答" in out["generation"]

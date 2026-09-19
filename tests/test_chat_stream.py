@@ -33,7 +33,7 @@ from backend.app.models import Base
 from backend.app.services import chat_service
 from langgraph.checkpoint.memory import InMemorySaver
 
-from test_graph import FakeRAGModel, FakeRetriever      # 复用同一套假件，避免重复实现
+from test_graph import FakeRAGModel, FakeVectorStore    # 复用同一套假件，避免重复实现
 
 
 # ============================ 工具 ============================
@@ -55,7 +55,7 @@ def _run_stream(monkeypatch, relevance_mode: str,
                 question: str = "LangGraph 怎么做持久化？") -> list[tuple[str, dict]]:
     """把 chat_service.get_graph 换成假件编译的图，跑完 stream_chat 并解析成事件列表。"""
     app = build_graph(model=FakeRAGModel(responses=[], relevance_mode=relevance_mode),
-                      retriever=FakeRetriever(), checkpointer=InMemorySaver())
+                      vectorstore=FakeVectorStore(), checkpointer=InMemorySaver())
     monkeypatch.setattr(chat_service, "get_graph", lambda: app)
     req = ChatRequest(question=question, thread_id="t-stream")
 
