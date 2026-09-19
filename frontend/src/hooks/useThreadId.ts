@@ -13,19 +13,34 @@ export function genId(): string {
   });
 }
 
-export function useThreadId(): { threadId: string; resetThreadId: () => string } {
-  const [threadId, setThreadId] = useState<string>(() => {
+export function useThreadId(): {
+  threadId: string;
+  /** 切到指定会话（侧栏点击用）。与 resetThreadId 的区别：换到的 id 由调用方给，
+   *  用于「回到某个已存在的会话」，而 resetThreadId 是开一段全新的。 */
+  setThreadId: (id: string) => void;
+  resetThreadId: () => string;
+} {
+  const [threadId, setThreadIdState] = useState<string>(() => {
     const saved = localStorage.getItem(KEY);
     if (saved) return saved;
     const id = genId();
     localStorage.setItem(KEY, id);
     return id;
   });
+
+  // 与 resetThreadId 一致：**写回 localStorage**。否则刷新后会回到切走前那个会话，
+  // 而用户在侧栏选的那个反而丢了。
+  const setThreadId = useCallback((id: string) => {
+    localStorage.setItem(KEY, id);
+    setThreadIdState(id);
+  }, []);
+
   const resetThreadId = useCallback(() => {
     const id = genId();
     localStorage.setItem(KEY, id);
-    setThreadId(id);
+    setThreadIdState(id);
     return id;
   }, []);
-  return { threadId, resetThreadId };
+
+  return { threadId, setThreadId, resetThreadId };
 }

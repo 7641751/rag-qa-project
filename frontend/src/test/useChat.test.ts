@@ -201,6 +201,37 @@ describe('useChat', () => {
     expect(result.current.deleteError).toBe('无法连接后端');
   });
 
+  // ---------- P3：LOAD_HISTORY 守卫的两半 ----------
+  it('切换会话时即使当前有消息也要替换（否则界面一直显示上一个会话）', async () => {
+    fetchHistoryMock.mockResolvedValue({ thread_id: 'tA', messages: [{ role: 'user', content: 'A 的问题' }] });
+    const { result } = renderHook(() => useChat());
+    await act(async () => { await new Promise(r => setTimeout(r, 0)); });
+    expect(result.current.messages).toHaveLength(1);
+
+    // 切到 B。回填时 A 的消息还在 state 里 —— 旧守卫（无消息才回填）会把这次回填整条挡掉
+    fetchHistoryMock.mockResolvedValue({ thread_id: 'tB', messages: [{ role: 'user', content: 'B 的问题' }] });
+    await act(async () => { result.current.setThreadId('tB'); await new Promise(r => setTimeout(r, 0)); });
+
+    expect(result.current.messages).toEqual([{ role: 'user', content: 'B 的问题' }]);
+  });
+
+  it('同一会话的迟到历史不冲掉用户刚发起的对话（守卫的另一半）', async () => {
+    let release!: (v: unknown) => void;
+    fetchHistoryMock.mockImplementation(() => new Promise(r => { release = r; }));   // 历史悬着
+    streamChatMock.mockImplementation(async (_b: unknown, h: any) =>
+      h.onDone({ thread_id: 't', rewrites: 0, grounded: true }));
+
+    const { result } = renderHook(() => useChat());
+    await act(async () => { result.current.send('刚发出的问题'); });                  // 用户先发了消息
+
+    release({ thread_id: 't', messages: [{ role: 'user', content: '很久以前的问题' }] });
+    await act(async () => { await new Promise(r => setTimeout(r, 0)); });
+
+    const contents = result.current.messages.map(m => (m.role === 'user' ? m.content : m.answer));
+    expect(contents).toContain('刚发出的问题');
+    expect(contents).not.toContain('很久以前的问题');      // 同一会话 → 守卫仍要拦住
+  });
+
   it('deleted:false(幂等)同样清空，且 thread_id 保持不变', async () => {
     streamChatMock.mockImplementation(async (_b: unknown, h: any) =>
       h.onDone({ thread_id: 't', rewrites: 0, grounded: true }));

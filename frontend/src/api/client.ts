@@ -3,6 +3,7 @@ import type {
   StepEvent, TokenEvent, SourcesEvent, DoneEvent, ErrorEvent, ErrorCode,
   KbStreamHandlers, KbProgressEvent, KbDoneEvent, KbListResponse, KbDeleteResponse,
   AuthUser, LoginRequest, LoginResponse, RegisterRequest,
+  ThreadListResponse, RenameRequest, RenameResponse,
 } from './types';
 import { clearToken, getToken } from './tokenStore';
 
@@ -249,4 +250,28 @@ export async function fetchMe(): Promise<AuthUser> {
   const res = await request('/auth/me');
   if (!res.ok) throw new Error(await errorText(res, '登录状态校验失败'));
   return (await res.json()) as AuthUser;
+}
+
+// ---------------------------------------------------------------- 会话列表（P3）
+
+/** GET /api/chat/threads → 当前用户的会话，按 updated_at 倒序、最多 50 条。
+ *  空列表返回 `200 {threads:[], total:0}`（不是 404），所以这里不把空当异常。 */
+export async function fetchThreads(): Promise<ThreadListResponse> {
+  const res = await request('/chat/threads');
+  if (!res.ok) throw new Error(`threads HTTP ${res.status}`);
+  return (await res.json()) as ThreadListResponse;
+}
+
+/** PATCH /api/chat/threads/{thread_id} → 重命名。
+ *  非本人 → 403、不存在 → 404、标题空或超 60 字 → 422；三者都抛后端给的 message，
+ *  调用方据此决定「回滚 + 行内提示」还是「从列表移除」。
+ *  用 PATCH 而非 PUT：只改 title 一个字段，语义上是部分更新。 */
+export async function renameThread(threadId: string, title: string): Promise<RenameResponse> {
+  const res = await request(`/chat/threads/${encodeURIComponent(threadId)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title } satisfies RenameRequest),
+  });
+  if (!res.ok) throw new Error(await errorText(res, '重命名失败'));
+  return (await res.json()) as RenameResponse;
 }

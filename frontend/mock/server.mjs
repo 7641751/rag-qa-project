@@ -11,7 +11,8 @@ const steps = [
 ];
 const tokens = ['要切分 markdown，', '用 `RecursiveCharacterTextSplitter.from_language', '(Language.MARKDOWN, ...)`。', '它按标题/代码围栏优先切分。'];
 const sources = [{ title: '01_文档加载与文本分割.md', snippet: 'RecursiveCharacterTextSplitter.from_language(...)', score: 0.82 }];
-// 按 thread_id 存历史：让 GET /api/chat/history 与 DELETE /api/chat/threads/{id} 有真实语义。
+// thread_id → { title, created_at, updated_at, messages }。
+// 带标题与时间戳是为了让侧栏（列表 / 相对时间 / 重命名）有**真实语义**而不是假数据。
 // Map.delete() 返回「是否真的删掉了」，恰好就是契约里的 deleted 字段。
 const threads = new Map();
 
@@ -140,7 +141,18 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && url.pathname === '/api/chat/history') {
     const tid = url.searchParams.get('thread_id') ?? '';
     // 未知/已删除的 thread → 200 + 空数组（契约：不报 404）
-    json(res, 200, { thread_id: tid, messages: threads.get(tid) ?? [] });
+    json(res, 200, { thread_id: tid, messages: threads.get(tid)?.messages ?? [] });
+    return;
+  }
+  // ---------- 会话列表（P3）----------
+  if (req.method === 'GET' && url.pathname === '/api/chat/threads') {
+    const all = [...threads.entries()]
+      .map(([thread_id, t]) => ({
+        thread_id, title: t.title, created_at: t.created_at, updated_at: t.updated_at,
+      }))
+      // 按 updated_at 倒序，与契约一致；total 是**真实总数**，列表最多回 50 条
+      .sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+    json(res, 200, { threads: all.slice(0, 50), total: all.length });
     return;
   }
   if (req.method === 'POST' && url.pathname === '/api/chat/stream') {
@@ -164,27 +176,47 @@ const server = http.createServer(async (req, res) => {
     res.write(frame('sources', { sources: ungrounded ? [] : sources }));
     await sleep(100);
     res.write(frame('done', { thread_id, rewrites: ungrounded ? 2 : 0, grounded: !ungrounded }));
-    // 记录本轮问答，让 history 与 delete 有真实语义
-    const hist = threads.get(thread_id) ?? [];
-    hist.push({ role: 'user', content: question });
-    hist.push({
+    // 记录本轮问答，让 history / 列表 / 删除都有真实语义
+    const now = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+    const t = threads.get(thread_id)
+      ?? { title: question.slice(0, 20), created_at: now, updated_at: now, messages: [] };
+    t.messages.push({ role: 'user', content: question });
+    t.messages.push({
       role: 'assistant',
       content: ungrounded ? '⚠ 本回答未命中知识库，基于模型通用知识（模拟）。' : tokens.join(''),
       sources: ungrounded ? [] : sources,
       grounded: !ungrounded,
     });
-    threads.set(thread_id, hist);
+    t.updated_at = now;              // 每次提问推进，列表据此倒序
+    threads.set(thread_id, t);
     res.end();
     return;
   }
 
-  // ---------- 聊天: 删除会话（幂等） ----------
-  const delThread = /^\/api\/chat\/threads\/([^/]+)$/.exec(url.pathname);
-  if (req.method === 'DELETE' && delThread) {
-    const id = decodeURIComponent(delThread[1]);
-    // Map.delete 的返回值就是契约的 deleted：本来不存在 → false，仍是 200（幂等，不报 404）
-    json(res, 200, { thread_id: id, deleted: threads.delete(id) });
-    return;
+  // ---------- 聊天: 单条会话（删除 / 重命名）----------
+  const threadPath = /^\/api\/chat\/threads\/([^/]+)$/.exec(url.pathname);
+  if (threadPath) {
+    const id = decodeURIComponent(threadPath[1]);
+    if (req.method === 'DELETE') {
+      // Map.delete 的返回值就是契约的 deleted：本来不存在 → false，仍是 200（幂等，不报 404）
+      json(res, 200, { thread_id: id, deleted: threads.delete(id) });
+      return;
+    }
+    if (req.method === 'PATCH') {
+      const body = await readJson(req);
+      const title = String(body?.title ?? '').trim();
+      if (!title || title.length > 60) {
+        json(res, 422, { code: 'VALIDATION_ERROR', message: 'title: 需 1-60 字' });
+        return;
+      }
+      const t = threads.get(id);
+      // mock 只有一个用户，做不出「别人的会话 → 403」；真后端的 403 由 pytest 守
+      if (!t) { json(res, 404, { code: 'NOT_FOUND', message: `会话不存在: ${id}` }); return; }
+      // 只改标题、**不动 updated_at**：重命名不该把会话顶到列表最前面
+      t.title = title;
+      json(res, 200, { thread_id: id, title });
+      return;
+    }
   }
 
   // ---------- KB: 列表 ----------

@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   parseSSEFrame, splitFrames, streamChat, uploadDocument, fetchDocuments, deleteDocument,
   deleteThread, fetchHistory, authHeaders, setUnauthorizedHandler,
+  fetchThreads, renameThread,
 } from '../api/client';
 import { getToken, setToken } from '../api/tokenStore';
 import type { StepEvent, TokenEvent, DoneEvent, ErrorEvent, KbProgressEvent, KbDoneEvent } from '../api/types';
@@ -207,6 +208,37 @@ describe('authHeaders / 401', () => {
     await expect(fetchHistory('t1')).rejects.toThrow(/401/);
 
     expect(onUnauthorized).not.toHaveBeenCalled();
+  });
+});
+
+// ============================ 会话列表（P3） ============================
+describe('fetchThreads / renameThread', () => {
+  it('fetchThreads 走 GET /api/chat/threads 并原样带出 total', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ threads: [{ thread_id: 't1', title: 'a', created_at: 'x', updated_at: 'y' }], total: 55 }),
+    } as unknown as Response);
+    vi.stubGlobal('fetch', fetchMock);
+
+    const r = await fetchThreads();
+
+    expect(fetchMock.mock.calls[0]![0]).toBe('/api/chat/threads');
+    expect(r.total).toBe(55);        // total 是「被 50 条截断」的唯一信号，不能丢
+  });
+
+  it('renameThread 用 PATCH、把新标题放进 body、并对 id 做 URL 编码', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true, json: async () => ({ thread_id: 't1', title: '新标题' }),
+    } as unknown as Response);
+    vi.stubGlobal('fetch', fetchMock);
+
+    const r = await renameThread('t1', '新标题');
+
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe('/api/chat/threads/t1');
+    expect(init.method).toBe('PATCH');
+    expect(init.body).toBe(JSON.stringify({ title: '新标题' }));
+    expect(r).toEqual({ thread_id: 't1', title: '新标题' });
   });
 });
 

@@ -91,3 +91,22 @@ export interface LoginResponse {
   token_type: string;      // 固定 'bearer'
   user: AuthUser;
 }
+
+// ---------- 会话列表（对齐 docs/api/openapi.yaml 的 Conversation* schema） ----------
+export interface ConversationSummary {
+  thread_id: string;
+  title: string;
+  created_at: string;      // ISO 8601 UTC
+  updated_at: string;      // 列表按它倒序
+}
+
+export interface ThreadListResponse {
+  threads: ConversationSummary[];
+  /** 后端**真实总数**。而 threads 最多 50 条，所以 total > threads.length 时前端要提示
+   *  「仅显示最近 50 条」—— 只看数组长度是看不出被截断的。 */
+  total: number;
+}
+
+export interface RenameRequest { title: string; }
+
+export interface RenameResponse { thread_id: string; title: string; }

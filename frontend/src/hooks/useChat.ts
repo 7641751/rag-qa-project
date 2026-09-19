@@ -19,6 +19,9 @@ type State = {
   deleting: boolean;
   /** 删除失败的中文提示；成功或重新打开弹窗时清空 */
   deleteError: string | null;
+  /** 当前 messages 属于哪个 threadId。LOAD_HISTORY 据此区分「切换会话」与「同一会话的
+   *  迟到响应」—— 两者要采取相反的策略，见 reducer 里的注释（P3 §10.3）。 */
+  forThread: string;
 };
 
 type Action =
@@ -29,7 +32,7 @@ type Action =
   | { type: 'SET_SOURCES'; sources: Source[] }
   | { type: 'FINISH'; grounded?: boolean }
   | { type: 'FAIL'; error: string }
-  | { type: 'LOAD_HISTORY'; messages: Msg[] }
+  | { type: 'LOAD_HISTORY'; messages: Msg[]; threadId: string }
   | { type: 'CLEAR' }
   | { type: 'DELETE_START' }
   | { type: 'DELETE_OK' }
@@ -62,9 +65,20 @@ function reducer(state: State, action: Action): State {
       return { ...state, streaming: false, messages: updateLastAssistant(state.messages, a => ({ ...a, status: 'done', grounded: action.grounded ?? a.grounded })) };
     case 'FAIL':
       return { ...state, streaming: false, messages: updateLastAssistant(state.messages, a => ({ ...a, status: 'error', error: action.error })) };
-    case 'LOAD_HISTORY':
-      // 仅当当前无消息时回填：避免异步历史冲掉用户刚发起的对话，也优雅处理 StrictMode 双调用
-      return state.messages.length === 0 ? { ...state, messages: action.messages, streaming: false } : state;
+    case 'LOAD_HISTORY': {
+      // 两类响应要区别对待（P3 §10.3）：
+      // ① 切换会话（目标 ≠ 当前 messages 所属）→ **必须替换**。切过去时旧会话的消息还留在
+      //    state 里，若仍用下面那条「无消息才回填」的守卫，新会话的历史会被整条挡掉，
+      //    界面继续显示上一个会话的内容 —— 这正是 P3 侧栏一上线就会暴露的 bug。
+      // ② 同一会话的迟到响应 → 保持「仅当无消息时回填」：避免异步历史冲掉用户刚发起的
+      //    对话，也优雅处理 StrictMode 双调用。
+      if (action.threadId !== state.forThread) {
+        return { ...state, messages: action.messages, streaming: false, forThread: action.threadId };
+      }
+      return state.messages.length === 0
+        ? { ...state, messages: action.messages, streaming: false }
+        : state;
+    }
     case 'CLEAR':
       // ⚠ 必须 ...state：State 新增了 deleting/deleteError，漏掉会 TS 报缺字段
       return { ...state, messages: [], streaming: false };
@@ -81,11 +95,24 @@ function reducer(state: State, action: Action): State {
   }
 }
 
-export function useChat() {
-  const [state, dispatch] = useReducer(reducer, {
-    messages: [], streaming: false, deleting: false, deleteError: null,
-  });
-  const { threadId, resetThreadId } = useThreadId();
+export interface UseChatOptions {
+  /** 一轮问答真正落库后回调（`done` 事件）。侧栏据此刷新列表 —— 新会话的
+   *  `conversations` 行是后端在**首次提问时** upsert 出来的，所以时机必须是 done 之后，
+   *  而不是点「＋ 新对话」的时候（§10.4）。用 props 传入而非全局事件总线，保持单向依赖。 */
+  onThreadTouched?: () => void;
+}
+
+export function useChat({ onThreadTouched }: UseChatOptions = {}) {
+  const { threadId, setThreadId, resetThreadId } = useThreadId();
+  // 用 init 函数把初始 threadId 灌进 forThread：挂载时 messages 就该被视作「属于当前会话」，
+  // 这样首次 fetchHistory 走的是「同一会话」那条守卫（无消息才回填），与改动前行为一致。
+  const [state, dispatch] = useReducer(
+    reducer,
+    threadId,
+    (tid: string): State => ({
+      messages: [], streaming: false, deleting: false, deleteError: null, forThread: tid,
+    }),
+  );
   const abortRef = useRef<AbortController | null>(null);
   /** 在飞的 SSE promise。deleteChat 必须先 await 它再发 DELETE：否则被取消的 astream
    *  可能在 DELETE 之后才写入 checkpoint，留下删不掉的残行（spec §4）。 */
@@ -103,7 +130,7 @@ export function useChat() {
                 // 刷新后靠它恢复警示标识；后端未持久化时为 null → 转成 undefined 不渲染
                 grounded: m.grounded ?? undefined },
         );
-        dispatch({ type: 'LOAD_HISTORY', messages: msgs });
+        dispatch({ type: 'LOAD_HISTORY', messages: msgs, threadId });
       })
       .catch(() => { /* 新会话或后端未就绪：静默 */ });
     return () => { alive = false; };
@@ -123,7 +150,7 @@ export function useChat() {
       onStep: e => dispatch({ type: 'ADD_STEP', step: e }),
       onToken: e => dispatch({ type: 'APPEND_TOKEN', text: e.text }),
       onSources: e => dispatch({ type: 'SET_SOURCES', sources: e.sources }),
-      onDone: e => dispatch({ type: 'FINISH', grounded: e.grounded }),
+      onDone: e => { dispatch({ type: 'FINISH', grounded: e.grounded }); onThreadTouched?.(); },
       onError: (e: ErrorEvent) => dispatch({ type: 'FAIL', error: e.message }),
     }).catch((err: unknown) => {
       if ((err as Error)?.name === 'AbortError') dispatch({ type: 'FINISH' });
@@ -134,7 +161,7 @@ export function useChat() {
       // 只在还是自己时清空：避免旧流晚 settle 把新流的 ref 抹掉
       if (streamRef.current === pending) streamRef.current = null;
     });
-  }, [state.streaming, threadId]);
+  }, [state.streaming, threadId, onThreadTouched]);
 
   const abort = useCallback(() => { abortRef.current?.abort(); }, []);
 
@@ -171,5 +198,9 @@ export function useChat() {
     messages: state.messages, streaming: state.streaming,
     deleting: state.deleting, deleteError: state.deleteError,
     send, abort, newChat, deleteChat, clearDeleteError, threadId,
+    /** 切到侧栏选中的会话（P3）。App 的 switchTo 会先 abort 再调它 ——
+     *  中断是必须的：SSE 回调直接 dispatch 到「最后一条 assistant 消息」，
+     *  不中断的话旧会话的 token 会追加到新会话的气泡里。 */
+    setThreadId,
   };
 }
