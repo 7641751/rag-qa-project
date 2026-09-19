@@ -9,6 +9,8 @@ servers:
   - url: http://localhost:8000
     description: 本地后端(开发期由 Vite proxy 转发 /api)
 tags:
+  - name: auth
+    description: 账号与鉴权
   - name: chat
     description: 问答与会话
   - name: kb
@@ -16,10 +18,66 @@ tags:
   - name: system
     description: 系统探针
 paths:
+  /api/auth/register:
+    post:
+      tags: [auth]
+      summary: 注册
+      description: >
+        成功 201。用户名已存在 → 409 USERNAME_TAKEN（大小写不敏感由 MySQL 的
+        utf8mb4_0900_ai_ci 排序规则保证，不是应用层比对）。字段不合法 → 422。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterRequest' }
+      responses:
+        '201':
+          description: 注册成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthUser' }
+        '409': { $ref: '#/components/responses/UsernameTaken' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+  /api/auth/login:
+    post:
+      tags: [auth]
+      summary: 登录
+      description: >
+        成功 200 + JWT。失败一律 401 INVALID_CREDENTIALS，且**不区分**「用户不存在」与
+        「密码错」—— 两者状态码、code、message 逐字相同，避免用户名被枚举。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+      responses:
+        '200':
+          description: 登录成功
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LoginResponse' }
+        '401': { $ref: '#/components/responses/InvalidCredentials' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+  /api/auth/me:
+    get:
+      tags: [auth]
+      summary: 当前登录用户
+      description: 回显 token 里的用户，用于前端启动时判断本地 token 是否仍有效。
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: 当前用户
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthUser' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
   /api/chat/stream:
     post:
       tags: [chat]
       summary: 提问并流式作答(SSE)
+      security:
+        - bearerAuth: []
       description: >
         返回 text/event-stream。帧格式 `event: <type>` 换行 `data: <json>` 换行换行。
         事件类型: step/token/sources/done/error。
@@ -27,6 +85,8 @@ paths:
         step 中 retrieve/grade_documents/rewrite_query 在节点完成时发(均在 token 前);
         generate 步骤可选地在首个 token 前补发。token.text 仅来自 generate 节点。
         出错: 发 error 后关闭流(不再有 done)。
+        需 Bearer token；thread_id 属于他人时在**流开始前**返回 403（响应头尚未发出，
+        仍可改状态码）。首次提问会把 thread_id→user_id 归属落库，title 取首问前 20 字。
       requestBody:
         required: true
         content:
@@ -38,13 +98,21 @@ paths:
           content:
             text/event-stream:
               schema: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '422': { $ref: '#/components/responses/ValidationError' }
         '503': { $ref: '#/components/responses/KBNotReady' }
   /api/chat/history:
     get:
       tags: [chat]
       summary: 拉取会话历史
-      description: 新/未知 thread_id 返回 200 + 空 messages(不报 404)。steps 不入历史。
+      security:
+        - bearerAuth: []
+      description: >
+        需 Bearer token。新/未知 thread_id 返回 200 + 空 messages(不报 404)——
+        库里没有归属行即视为新会话放行，只有「已有行且非本人」才 403。
+        归属校验先于读 checkpointer，故 403 不受 checkpointer 是否可读影响。
+        steps 不入历史。
       parameters:
         - name: thread_id
           in: query
@@ -56,12 +124,19 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/HistoryResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
   /api/chat/threads/{thread_id}:
     delete:
       tags: [chat]
-      summary: 删除会话的全部 checkpoint(幂等)
+      summary: 删除会话的全部服务端状态(幂等)
+      security:
+        - bearerAuth: []
       description: >
-        删除该 thread 在 checkpointer 中的全部 checkpoint 与 write 行，不可恢复。
+        需 Bearer token；非本人 → 403，且不产生任何副作用。
+        删除该 thread 在 checkpointer 中的全部 checkpoint 与 write 行，
+        以及 conversations 里的归属索引行(漏删会让已删会话在 P3 的会话列表里复活)，
+        不可恢复。
         幂等: 未知/已删过的 thread_id 返回 200 + deleted=false(不是 404)。
         与 KB 的 DELETE(404) 故意不同: doc_id 来自服务端列表，thread_id 由前端本地生成。
         删除后 GET /api/chat/history 仍返回 200 + 空 messages。
@@ -77,6 +152,8 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ChatDeleteResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
         '422': { $ref: '#/components/responses/ValidationError' }
   /api/health:
     get:
@@ -92,6 +169,8 @@ paths:
     post:
       tags: [kb]
       summary: 上传文档并入库(SSE 进度)
+      security:
+        - bearerAuth: []
       description: >
         返回 text/event-stream。帧格式 `event: <type>` 换行 `data: <json>` 换行换行。
         事件类型: progress/done/error。
@@ -117,10 +196,13 @@ paths:
               schema: { type: string }
         '413': { $ref: '#/components/responses/FileTooLarge' }
         '415': { $ref: '#/components/responses/UnsupportedFileType' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
         '422': { $ref: '#/components/responses/ValidationError' }
     get:
       tags: [kb]
       summary: 列出用户上传的文档
+      security:
+        - bearerAuth: []
       description: >
         只返回 origin="upload" 的文档，按 uploaded_at 倒序。
         空库返回 200 + 空 documents(不报 404)。
@@ -131,10 +213,13 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/KbListResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
   /api/kb/documents/{doc_id}:
     delete:
       tags: [kb]
       summary: 删除上传文档的全部向量块
+      security:
+        - bearerAuth: []
       description: >
         删除过滤条件必须为 {"$and":[{"doc_id":X},{"origin":"upload"}]}，
         因此预置文档不可删(过滤为空 → 404)。
@@ -150,8 +235,19 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/KbDeleteResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/DocNotFound' }
 components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        `Authorization: Bearer <access_token>`。token 由 POST /api/auth/login 签发，
+        默认 7 天有效（settings.jwt_expire_days）。缺失 / 非 Bearer / 过期 / 被篡改
+        一律 401 UNAUTHORIZED，且文案不区分具体原因 —— 对客户端都是「重新登录」。
+        本期不实现 refresh token：过期即重新登录。
   schemas:
     ChatRequest:
       type: object
@@ -198,7 +294,7 @@ components:
       type: object
       required: [code, message]
       properties:
-        code: { type: string, enum: [VALIDATION_ERROR, RETRIEVAL_ERROR, LLM_ERROR, INTERNAL_ERROR, UNSUPPORTED_FILE_TYPE, FILE_TOO_LARGE, PARSE_ERROR, EMPTY_DOCUMENT, EMBEDDING_ERROR, NOT_FOUND] }
+        code: { type: string, enum: [VALIDATION_ERROR, RETRIEVAL_ERROR, LLM_ERROR, INTERNAL_ERROR, UNSUPPORTED_FILE_TYPE, FILE_TOO_LARGE, PARSE_ERROR, EMPTY_DOCUMENT, EMBEDDING_ERROR, NOT_FOUND, UNAUTHORIZED, INVALID_CREDENTIALS, FORBIDDEN, USERNAME_TAKEN] }
         message: { type: string }
     HistoryMessage:
       type: object
@@ -227,7 +323,9 @@ components:
           type: boolean
           description: >
             删除前该 thread 是否存在至少一个 checkpoint。false = 本来就不存在(幂等，非错误)。
-            后端需先用 checkpointer.get_tuple(config) 探测，因为 delete_thread 返回 None。
+            adelete_thread 返回 None，拿不到是否真删了，后端需先探测存在性：
+            checkpointer.alist(config, limit=1) 轻量判断即可（AsyncSqliteSaver 异步接口，
+            其同步桥接方法在事件循环线程上调用会抛 InvalidStateError）。
     Health:
       type: object
       required: [status]
@@ -281,6 +379,54 @@ components:
         doc_id: { type: string, format: uuid }
         filename: { type: string }
         deleted_chunks: { type: integer, minimum: 0 }
+    AuthUser:
+      type: object
+      required: [id, username]
+      properties:
+        id: { type: integer, description: 用户主键 }
+        username: { type: string }
+    RegisterRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+          minLength: 3
+          maxLength: 32
+          pattern: '^[A-Za-z0-9_]+$'
+          description: 3–32 位，仅字母 / 数字 / 下划线
+        password:
+          type: string
+          minLength: 8
+          description: >
+            至少 8 位，且 **UTF-8 编码后 ≤ 72 字节**：bcrypt 的硬上限，超出返回 422。
+            注意单位是**字节不是字符** —— 30 个汉字就有 90 字节，会被拒。
+            两层都做这个检查且都要保留：schema 层（@field_validator）负责让 422 定位到
+            password 字段；security.hash_password 那层则覆盖改密码等不经过本模型的路径。
+    LoginRequest:
+      type: object
+      required: [username, password]
+      description: >
+        字段约束与 RegisterRequest **完全相同**（后端复用同一个 pydantic 模型 Auth）。
+        但凭证校验失败时，响应必须与「用户名不存在」无法区分：无论哪种原因都是
+        401 INVALID_CREDENTIALS 且 message 逐字相同，避免用户名被枚举。
+      properties:
+        username:
+          type: string
+          minLength: 3
+          maxLength: 32
+          pattern: '^[A-Za-z0-9_]+$'
+        password:
+          type: string
+          minLength: 8
+          description: UTF-8 编码后 ≤ 72 字节（与 RegisterRequest 同一套约束）
+    LoginResponse:
+      type: object
+      required: [access_token, token_type, user]
+      properties:
+        access_token: { type: string, description: JWT }
+        token_type: { type: string, enum: [bearer] }
+        user: { $ref: '#/components/schemas/AuthUser' }
     ErrorBody:
       type: object
       required: [code, message]
@@ -310,6 +456,28 @@ components:
           schema: { $ref: '#/components/schemas/ErrorBody' }
     DocNotFound:
       description: doc_id 不存在(或指向不可删的预置文档)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorBody' }
+    Unauthorized:
+      description: 缺少 / 非 Bearer / 过期 / 被篡改的 token（code=UNAUTHORIZED）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorBody' }
+    Forbidden:
+      description: 已登录，但目标 thread_id 不属于当前用户（code=FORBIDDEN）
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorBody' }
+    InvalidCredentials:
+      description: >
+        用户名或密码错（code=INVALID_CREDENTIALS）。**故意不区分**这两种情况，
+        文案逐字相同，避免用户名枚举。
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorBody' }
+    UsernameTaken:
+      description: 注册时用户名已存在（code=USERNAME_TAKEN）
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorBody' }

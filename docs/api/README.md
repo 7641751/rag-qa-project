@@ -10,19 +10,44 @@ CRAG（纠错式检索增强）问答后端的接口契约。前端（`frontend/
 
 ## 端点清单
 
-| 方法 | 路径 | 用途 | 响应类型 |
-|---|---|---|---|
-| `POST` | `/api/chat/stream` | 提问并流式作答 | `text/event-stream` |
-| `GET` | `/api/chat/history` | 拉取会话历史（`?thread_id=`） | `application/json` |
-| `DELETE` | `/api/chat/threads/{thread_id}` | 删除会话的全部服务端状态（幂等） | `application/json` |
-| `POST` | `/api/kb/documents` | 上传文档并入库（SSE 进度） | `text/event-stream` |
-| `GET` | `/api/kb/documents` | 列出用户上传的文档 | `application/json` |
-| `DELETE` | `/api/kb/documents/{doc_id}` | 删除上传文档的全部向量块 | `application/json` |
-| `GET` | `/api/health` | 健康检查 / 就绪探针 | `application/json` |
+| 方法 | 路径 | 用途 | 需登录 | 响应类型 |
+|---|---|---|---|---|
+| `POST` | `/api/auth/register` | 注册 | — | `application/json` |
+| `POST` | `/api/auth/login` | 登录，换取 JWT | — | `application/json` |
+| `GET` | `/api/auth/me` | 当前登录用户 | ✅ | `application/json` |
+| `POST` | `/api/chat/stream` | 提问并流式作答 | ✅ | `text/event-stream` |
+| `GET` | `/api/chat/history` | 拉取会话历史（`?thread_id=`） | ✅ | `application/json` |
+| `DELETE` | `/api/chat/threads/{thread_id}` | 删除会话的全部服务端状态（幂等） | ✅ | `application/json` |
+| `POST` | `/api/kb/documents` | 上传文档并入库（SSE 进度） | ✅ | `text/event-stream` |
+| `GET` | `/api/kb/documents` | 列出用户上传的文档 | ✅ | `application/json` |
+| `DELETE` | `/api/kb/documents/{doc_id}` | 删除上传文档的全部向量块 | ✅ | `application/json` |
+| `GET` | `/api/health` | 健康检查 / 就绪探针 | — | `application/json` |
+
+> 「需登录」= 必须带 `Authorization: Bearer <access_token>`，缺失 / 过期 / 被篡改一律 `401`。`/api/health` 保持公开 —— 网关与容器健康检查不会带 token。详见下方「鉴权」。
 
 > 提问用 `POST` 而非 `GET`：中文长问题走 body，避开 URL 长度/编码限制。
 >
 > 上传用 `POST` **单文件**而非多文件：每个文件一条独立 SSE 流，进度互不干扰、错误互相隔离（第 2 个文件解析失败不影响第 1 个已入库）。前端多选时**串行**发 N 个请求。
+
+---
+
+## 鉴权
+
+**Bearer JWT**。除 `/api/health`、`/api/auth/register`、`/api/auth/login` 外，所有端点都要求请求头：
+
+```
+Authorization: Bearer <access_token>
+```
+
+- **签发**：`POST /api/auth/login` 返回 `access_token`，默认有效期 **7 天**（`RAGQA_JWT_EXPIRE_DAYS`）。本期不做 refresh token —— 过期即重新登录。
+- **失败**：`401` + `{"code":"UNAUTHORIZED","message":...}`。缺失、非 Bearer、过期、签名被篡改**四种情况返回完全相同的响应**，对客户端都是「重新登录」，不给探测留差异。
+- **`401` 与 `403` 的分工**：`401` = 没登录或凭证无效；`403` = 登录了，但目标资源不属于你。前端只在 `401` 时清 token 并跳登录页；`403` 只提示错误，**不清空当前消息**。
+- **归属规则**（`/api/chat/*`）：`thread_id` 由前端本地生成，归属记录在 `conversations` 表。
+  - 库里**没有**该 `thread_id` → 视为新会话，**放行**并返回 `200 {"messages": []}`。此处若返回 `403`，前端用新 uuid 第一次打开会话时就永远打不开。
+  - 库里有、但不是本人 → `403 FORBIDDEN`。
+  - 首次提问会把 `thread_id → user_id` 落库，`title` 取首问前 20 字；后续提问只刷新 `updated_at`，标题与归属都不再变。
+- **`403` 在流开始前**：`/api/chat/stream` 的归属校验发生在返回 `StreamingResponse` **之前**，所以拿到的是 HTTP `403` 而不是 SSE `error` 帧 —— 前端不必为同一端点写两套错误处理。同理，校验先于读 checkpointer，`403` 不因 checkpointer 不可读而变成 `500`。
+- **知识库本期不做归属隔离（已知缺口）**：上传件的 metadata 里不写 `user_id`，服务端无从判断某个 `doc_id` 属于谁，因此**任何登录用户都能删除任何上传件**。本期只要求登录，归属隔离留待 P3（届时 metadata 加 `user_id` + 检索过滤）。`frontend/` 不要基于「KB 已隔离」做假设。
 
 ---
 
@@ -369,10 +394,14 @@ curl -N -X POST http://localhost:8000/api/kb/documents -F "file=@/path/to/notes.
 
 **禁止**返回 `200` 却在 body 里塞错误文本（反模式，前端无法区分成功与失败）。
 
-统一错误码（共 10 个）：
+统一错误码（共 14 个）：
 
 | 归属 | code | 触发方式 |
 |---|---|---|
+| 鉴权 | `UNAUTHORIZED` | HTTP `401`（token 缺失 / 非 Bearer / 过期 / 被篡改） |
+| 鉴权 | `INVALID_CREDENTIALS` | HTTP `401`（登录的用户名或密码错，**故意不区分**两种原因） |
+| 鉴权 | `FORBIDDEN` | HTTP `403`（已登录，但 thread 不属于本人） |
+| 鉴权 | `USERNAME_TAKEN` | HTTP `409`（注册时用户名已存在） |
 | 聊天 | `VALIDATION_ERROR` | HTTP `422` |
 | 聊天 | `RETRIEVAL_ERROR` | SSE `error` |
 | 聊天 | `LLM_ERROR` | SSE `error` |
