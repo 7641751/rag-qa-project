@@ -94,18 +94,19 @@ sequenceDiagram
 ### 5.2 过滤条件
 
 ```python
-from backend.app.function_tools import BUILTIN_KB
+from tools.upload_function_tools import BUILTIN_KB
+
 
 def kb_filter(user_id: int | None) -> dict | None:
-    """检索范围：预置官方文档全局共享 + 本人上传件。
+   """检索范围：预置官方文档全局共享 + 本人上传件。
 
-    ⚠ Chroma 的 $and / $or **至少要两个子条件**，单条件包一层会抛 ValueError
-      （function_tools.py:14-15、项目 README:438）。所以无 user_id 时直接返回
-      裸条件，不能写 {"$or": [{"kb": BUILTIN_KB}]}。
-    """
-    if user_id is None:          # CLI run.py 等无登录态的调用方：只检索预置文档
-        return {"kb": BUILTIN_KB}
-    return {"$or": [{"kb": BUILTIN_KB}, {"user_id": user_id}]}
+   ⚠ Chroma 的 $and / $or **至少要两个子条件**，单条件包一层会抛 ValueError
+     （function_tools.py:14-15、项目 README:438）。所以无 user_id 时直接返回
+     裸条件，不能写 {"$or": [{"kb": BUILTIN_KB}]}。
+   """
+   if user_id is None:  # CLI run.py 等无登录态的调用方：只检索预置文档
+      return {"kb": BUILTIN_KB}
+   return {"$or": [{"kb": BUILTIN_KB}, {"user_id": user_id}]}
 ```
 
 已验证 `filter` 会透传给 Chroma 的 `where`：`Chroma.similarity_search(query, k, filter)` → `similarity_search_with_score(..., where=filter)`（`langchain_chroma/vectorstores.py:730-754, 817-857`）。类型标注虽写 `dict[str, str]`，实际不做限制，`$or` 嵌套可用。

@@ -21,7 +21,7 @@ router = APIRouter(prefix="/api/kb", tags=["kb"])
 DbSession = Annotated[AsyncSession, Depends(get_db_session)]
 CurrentUser = Annotated[AuthUser, Depends(get_current_user)]
 
-# 以下三个端点都要求登录，但**本期不校验归属**（spec §3 决策 4）：上传件的 metadata 里
+
 # 不写 user_id，服务端无从判断某个 doc_id 属于谁，所以 _user 只声明、不使用。
 # 用 `_` 前缀是刻意的 —— 标明"这里故意不用它"，免得后人误以为漏了校验，或顺手补一个
 # 拿不到依据的 owner 判断。归属隔离留待 P3（届时 metadata 加 user_id + 检索过滤）。

@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
-"""知识库上传链路的通用工具：SSE 帧 / 错误响应 / 解析切分 / 嵌入入库 / 元数据查询。
+"""知识库上传链路的通用工具：SSE 帧 / 解析切分 / 嵌入入库 / 元数据查询。
+
+（契约格式的错误响应原语 `err()` / `api_error()` 已抽到同层的 `http_tools.py`，
+各层共用一份，理由见那里关于「为什么必须两套」的说明。）
 
 契约见 docs/api/README.md「知识库端点」。改这里之前先记住三条硬约定：
 
@@ -17,15 +20,12 @@
 import io
 import json
 import re
-from datetime import timezone
-from functools import lru_cache
+from datetime import timezone, datetime
 from pathlib import Path
 
-from fastapi.responses import JSONResponse
 from langchain_core.documents import Document
 from langchain_text_splitters import Language, RecursiveCharacterTextSplitter
 
-from agent.schemas import Base
 from backend.app.agent.graph import get_vectorstore
 from config import settings
 
@@ -45,13 +45,7 @@ _PLAIN_SPLITTER = RecursiveCharacterTextSplitter(
     chunk_size=settings.chunk_size, chunk_overlap=settings.chunk_overlap)
 
 
-# ---------------------------------------------------------------- HTTP / SSE 原语
-def err(status: int, code: str, message: str) -> JSONResponse:
-    """契约要求错误体是 {"code","message"}，而 raise HTTPException 会得到 {"detail": ...}，
-    所以流开始前的错误**直接返回 JSONResponse**（比装异常处理器简单）。"""
-    return JSONResponse(status_code=status, content={"code": code, "message": message})
-
-
+# ---------------------------------------------------------------- 时间戳与 SSE 帧
 def now_iso() -> str:
     """ISO 8601 UTC 时间字符串，如 2026-09-11T10:23:41Z。"""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -222,55 +216,3 @@ def remove_upload_copies(doc_id: str) -> None:
         path.unlink(missing_ok=True)
 
 
-# ---------------------------------------------------------------- mysql数据库相关
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from datetime import datetime
-
-
-def init_mysql():
-    """初始化 MySQL 数据库连接，返回数据库会话工厂。"""
-
-
-async def get_db_session():
-    """
-    获取数据库会话
-    """
-    AsyncSessionLocal = await get_db_session_maker()
-    async with AsyncSessionLocal() as session:
-        try:
-            yield session
-        finally:
-            await session.close()
-
-
-@lru_cache(1)
-def get_db_engine():
-    """
-    获取数据库引擎
-    """
-    engine = create_async_engine(
-        settings.MYSQL_DATABASE_URL,
-        echo=True,  # 打印 SQL 语句（开发环境）
-        future=True  # 使用 SQLAlchemy 2.0 风格
-    )
-    return engine
-
-@lru_cache(1)
-def get_db_session_maker():
-    """
-    获取数据库会话工厂
-    """
-    engine = get_db_engine()
-    return async_sessionmaker(
-        engine,
-        class_=AsyncSession,
-        expire_on_commit=False  # 提交后不过期，允许访问属性
-    )
-
-# 初始化数据库表（创建所有表）
-async def init_db():
-    """创建所有表"""
-    engine = get_db_engine()
-    async with engine.begin() as conn:
-        await conn.run_sync(lambda sync_conn: Base.metadata.create_all(sync_conn))
-    print("✅ 数据库表创建完成")

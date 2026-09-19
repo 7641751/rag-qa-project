@@ -36,11 +36,7 @@ async def upsert_conversation(db: AsyncSession, *, thread_id: str,
 
 
 async def assert_owner(db: AsyncSession, thread_id: str, user_id: int) -> None:
-    """无行 = 新会话（放行）；有行且不是本人 = 403。
-
-    **无行必须放行**：前端 useThreadId 在本地生成 uuid 后立刻可能调 history
-    （useChat.ts 的挂载逻辑），此时后端还没有这一行。若返回 403，新会话永远打不开。
-    """
+    """校验会话归属：thread_id → user_id 的映射。"""
     row = await db.get(Conversation, thread_id)
     if row is not None and row.user_id != user_id:
         api_error(403, "FORBIDDEN", "该会话不属于当前用户")

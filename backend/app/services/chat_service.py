@@ -5,8 +5,12 @@ chat_service 模块包含聊天相关的服务。
 from langchain_core.messages import HumanMessage, AIMessage, AIMessageChunk
 from langchain_core.runnables import RunnableConfig
 import json
-from backend.app.agent.schemas import ChatRequest, RAGState, HistoryResponse, HistoryMessage
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from backend.app.agent.schemas import ChatRequest, RAGState, HistoryResponse, HistoryMessage, ChatDeleteResponse
 from backend.app.agent.graph import build_graph, get_graph
+from backend.app.services import conversation_service
 
 LABELS = {"retrieve": "检索", "grade_documents": "评分",
           "rewrite_query": "重写", "generate": "生成"}
@@ -25,8 +29,7 @@ async def stream_chat(chat_request: ChatRequest):
                 for node, delta in chunk.items():
                     if node == "generate":
                         # 接住兜底文本：正常路径的 token 已由 messages 流逐字推完（本 update 在 token 之后，
-                        # 跳过避免重复发 step）；但兜底分支不调用 model → 没有 AIMessageChunk →
-                        # 一帧 token 都不会发，前端答案气泡会是空白的。先存下来，循环结束后按需补发。
+                        # 跳过避免重复发 step）；兜底分支调用 model →
                         gen_text = delta.get("generation", "") or gen_text
                         continue
                     detail = None
@@ -38,7 +41,7 @@ async def stream_chat(chat_request: ChatRequest):
                     elif node == "rewrite_query":
                         rewrites = delta.get("rewrites", rewrites)
                         detail = f"重写为: {delta.get('question', '')[:30]}"
-                    yield sse("step", {"node": node, "label": LABELS[node], "detail": detail})
+                    yield sse("step", {"node": node, "label": LABELS.get(node, node), "detail": detail})
             elif mode == "messages":
                 msg, meta = chunk
                 # 关键：只放行 generate 节点的 token，过滤掉 grade/rewrite 的 JSON 结构化输出
@@ -58,7 +61,7 @@ async def stream_chat(chat_request: ChatRequest):
             yield sse("token", {"text": gen_text})
         yield sse("sources", {"sources": [_to_source(d) for d in final_docs]})
         # grounded 用 bool(final_docs) 确定性得出：grade 后还留着资料 = 有知识库依据。
-        # 不靠模型自述——模型不会可靠地告诉你它哪句是编的。
+
         yield sse("done", {"thread_id": chat_request.thread_id, "rewrites": rewrites,
                            "grounded": bool(final_docs)})
     except Exception as exc:
@@ -77,10 +80,15 @@ def _to_source(doc) -> dict:
             "score": None}  # as_retriever 无分数，契约里 score 可为 null
 
 
-def get_chat_history(thread_id: str) -> HistoryResponse:
+async def get_chat_history(thread_id: str, user_id: int, db: AsyncSession) -> HistoryResponse:
+    # 归属校验**前置**：先判「能不能看」，再去读 checkpointer。反过来会让「读失败」
+    # 抛出 500 而不是 403，攻击者就能靠状态码差异判断 thread_id 是否存在。
+    # 无行 = 新会话，assert_owner 会放行（spec §7.5）。
+    await conversation_service.assert_owner(db, thread_id, user_id)
     graph = get_graph()
     config = {"configurable": {"thread_id": thread_id}}
-    state = graph.get_state(config)
+    # AsyncSqliteSaver 原生异步，直接 await；不再需要 to_thread 绕线程池
+    state = await graph.aget_state(config)
     messages = (state.values or {}).get("messages", [])
     out = [h for h in (_msg_to_history(m) for m in messages) if h is not None]
     return HistoryResponse(thread_id=thread_id, messages=out)
@@ -97,3 +105,49 @@ def _msg_to_history(m):
         return HistoryMessage(role="assistant", content=m.content,
                               sources=ak.get("sources"), grounded=ak.get("grounded"))
     return None  # SystemMessage 等不进历史
+
+
+async def delete_chat_thread(thread_id: str, user_id: int,
+                             db: AsyncSession) -> ChatDeleteResponse:
+    """删除一个会话的全部服务端状态：checkpoints + writes + 归属索引行。
+
+    幂等：不存在也返回 deleted=False。归属校验在前（非本人 → 403，不产生任何副作用）。
+    """
+    await conversation_service.assert_owner(db, thread_id, user_id)
+    checkpointer = get_graph().checkpointer
+    config = {"configurable": {"thread_id": thread_id}}
+
+    # adelete_thread 返回 None，拿不到「是否真删了」，所以先探测存在性。
+    # 用 alist(limit=1) 只取最新一条判断有无。先探测还有个附带作用：alist 内部会惰性
+    # setup 建表，避免「从未写过任何会话的新库」上直接 DELETE 报 no such table。
+    # 显式 aclose：只取一条就中断，挂起的生成器仍持有 saver 锁，等 GC 才释放会卡并发写入。
+    agen = checkpointer.alist(config, limit=1)
+    try:
+        existed = await anext(agen, None) is not None
+    finally:
+        await agen.aclose()
+
+    await checkpointer.adelete_thread(thread_id)
+    # 索引行也要删（spec §7.6 第 3 步）：只删 checkpointer 会留下孤儿行，而 P3 的会话
+    # 列表正是查这张表 —— 孤儿行会让已删会话重新出现在侧栏，点进去又是空的。
+    # 顺序刻意是「先删不可逆的 checkpoint、再删可重建的索引行」：万一中途失败，结果是
+    # 「列表里已消失但历史还在」（再删一次即可），比留下孤儿行好排查。
+    await conversation_service.delete_conversation_row(db, thread_id)
+    await db.commit()
+    return ChatDeleteResponse(thread_id=thread_id, deleted=existed)
+
+async def prepare_stream(chat_request: ChatRequest, user_id: int,
+                         db: AsyncSession):
+    """鉴权 + upsert 完成后，把流生成器交给路由。
+
+    必须与 stream_chat 分开：`403` 要在返回 StreamingResponse **之前**抛出，
+    一旦响应头发出就只能降级成 SSE error 帧，前端得为同一端点写两套错误处理。
+
+    返回的是异步生成器（不是协程），路由直接交给 StreamingResponse。
+    """
+    await conversation_service.assert_owner(db, chat_request.thread_id, user_id)
+    await conversation_service.upsert_conversation(
+        db, thread_id=chat_request.thread_id, user_id=user_id,
+        question=chat_request.question)
+    await db.commit()
+    return stream_chat(chat_request)

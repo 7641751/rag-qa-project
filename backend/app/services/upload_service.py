@@ -17,8 +17,9 @@ import uuid
 from fastapi import File, UploadFile
 from starlette.responses import StreamingResponse
 
-from backend.app.function_tools import (
-    EMBED_BATCH, delete_upload_doc, doc_title, embed_batch, err, find_upload_doc_ids,
+from backend.tools.http_tools import err
+from backend.tools.upload_function_tools import (
+    EMBED_BATCH, delete_upload_doc, doc_title, embed_batch, find_upload_doc_ids,
     now_iso, parse_and_split, remove_upload_copies, save_upload_copy, sse,
 )
 

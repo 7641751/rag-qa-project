@@ -8,13 +8,16 @@
                 重写次数用尽   -> generate（无资料：放开自由度，用模型自有知识作答并自我声明）
 
 设计要点：
-- build_graph(model=None, retriever=None) 支持依赖注入，
+- build_graph(model=None, retriever=None, checkpointer=None) 支持依赖注入，
   测试时可传入 FakeChatModel / 内存检索器，零 API 额度跑通全图。
 - 每个节点是纯函数：输入状态 -> 输出增量更新。
 """
+import aiosqlite
+
 from langchain_chroma import Chroma
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from config import settings
 from backend.app.agent.schemas import RAGState, GradeDocuments, RewrittenQuery
@@ -47,6 +50,34 @@ def get_vectorstore():
         persist_directory=str(settings.chroma_dir),
     )
 
+@lru_cache(maxsize=1)
+def get_checkpointer() -> AsyncSqliteSaver:
+    """AsyncSqliteSaver 单例（异步调用面专用）。三条约束缺一即出问题：
+    ① 不用 `from_conn_string` 的 async with —— 退出即关连接，而单例要活到进程结束；
+       手动 aiosqlite.connect 建连接，由 lru_cache 单例持有。
+    ② 必须在运行中的事件循环里构造 —— __init__ 会捕获 get_running_loop() 存 self.loop，
+       所以只能由异步上下文首次触发（uvicorn 请求期 / CLI 的 asyncio.run）；
+       模块顶层或纯同步上下文构造会 RuntimeError。
+    ③ 建表是惰性的：aget_tuple / alist 首次调用会 await setup()（幂等），无需手动 setup()。
+    另注意：它的同步桥接方法（get_tuple/delete_thread 等）只允许跨线程调用，
+    在事件循环线程上直接调会抛 InvalidStateError —— 服务层一律 await 异步版。
+    """
+    settings.checkpoint_db.parent.mkdir(parents=True, exist_ok=True)
+    return AsyncSqliteSaver(aiosqlite.connect(str(settings.checkpoint_db)))
+
+
+async def aclose_checkpointer() -> None:
+    """关闭 checkpointer 单例的连接（进程收尾专用）。
+
+    aiosqlite 的工作线程是**非 daemon** 的：只有 close() 才会入队退出哨兵，
+    否则解释器退出时会一直等这个线程 —— CLI 跑完进程不退出、uvicorn Ctrl+C 不退出。
+    close 后顺手清掉 lru_cache：同一进程若再起新的 asyncio.run（新事件循环），
+    下次建图会重建全新连接，避免旧连接跨事件循环复用。
+    调用时机：run.py 的 asyncio.run 收尾、api/main.py 的 lifespan shutdown。
+    """
+    if get_checkpointer.cache_info().currsize:
+        await get_checkpointer().conn.close()
+        get_checkpointer.cache_clear()
 
 
 # ---------- 提示词 ----------
@@ -198,8 +229,8 @@ def _decide_to_generate(state: RAGState):
     return "generate"  # 兜底：generate 无资料时会用模型自有知识作答（grounded=False）
 
 
-def build_graph(model=None, retriever=None, thread_id=None):
-    """构建并编译 RAG 工作流。model/retriever 可注入用于测试。"""
+def build_graph(model=None, retriever=None, checkpointer=None):
+    """构建并编译 RAG 工作流。model/retriever/checkpointer 可注入用于测试。"""
     from langgraph.graph import END, START, StateGraph
 
     model = model or get_model()
@@ -219,18 +250,20 @@ def build_graph(model=None, retriever=None, thread_id=None):
     )
     b.add_edge("rewrite_query", "retrieve")
     b.add_edge("generate", END)
-    return b.compile(checkpointer=InMemorySaver())
+    # 默认走 AsyncSqliteSaver 单例；测试必须显式传 InMemorySaver，避免写入真实 db
+    return b.compile(checkpointer=checkpointer or get_checkpointer())
 
 
 def print_ascii_graph():
-    """打印工作流结构图（需要 grandalf 依赖）。"""
-    graph = build_graph()
+    """打印工作流结构图（需要 grandalf 依赖）。这里是同步上下文，
+    AsyncSqliteSaver 单例构造需要运行中的事件循环，用 InMemorySaver 占位即可。"""
+    graph = build_graph(checkpointer=InMemorySaver())
     print(graph.get_graph().draw_ascii())
 
 
 @lru_cache(maxsize=1)
 def get_graph():
-    return build_graph()  # 只编译一次，InMemorySaver 跨请求保留 thread 状态
+    return build_graph()  # 只编译一次；checkpointer 单例跨请求保留 thread 状态
 
 
 if __name__ == "__main__":

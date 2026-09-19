@@ -28,6 +28,7 @@ from langchain_core.documents import Document
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
+from langgraph.checkpoint.memory import InMemorySaver
 
 from config import settings
 from backend.app.agent.graph import _decide_to_generate, _make_nodes, build_graph
@@ -127,7 +128,7 @@ def _model(**kwargs) -> FakeRAGModel:
 # ============================ 1. 图结构 ============================
 def test_graph_compiles_with_all_nodes():
     """图能成功编译，且包含 retrieve / grade / rewrite / generate 四个节点。"""
-    app = build_graph(model=_model(), retriever=FakeRetriever())
+    app = build_graph(model=_model(), retriever=FakeRetriever(), checkpointer=InMemorySaver())
     assert app is not None
     node_names = set(app.get_graph().nodes)
     assert {"retrieve", "grade_documents", "rewrite_query", "generate"} <= node_names
@@ -137,7 +138,7 @@ def test_graph_compiles_with_all_nodes():
 def test_happy_path_all_relevant(base_state):
     """全部相关 -> 检索一次即直答，不触发改写。"""
     retriever = FakeRetriever()
-    app = build_graph(model=_model(relevance_mode="all"), retriever=retriever)
+    app = build_graph(model=_model(relevance_mode="all"), retriever=retriever, checkpointer=InMemorySaver())
     result = app.invoke(base_state, config={"configurable": {"thread_id": "test"}, "recursion_limit": 20})
 
     assert result["rewrites"] == 0
@@ -148,7 +149,7 @@ def test_happy_path_all_relevant(base_state):
 
 def test_partial_relevance_keeps_only_relevant(base_state):
     """部分相关 -> grade 只保留判为相关的文档，仍然直答。"""
-    app = build_graph(model=_model(relevance_mode="first"), retriever=FakeRetriever())
+    app = build_graph(model=_model(relevance_mode="first"), retriever=FakeRetriever(), checkpointer=InMemorySaver())
     result = app.invoke(base_state, config={"configurable": {"thread_id": "test"}, "recursion_limit": 20})
 
     assert [d.metadata["title"] for d in result["documents"]] == ["Persistence"]
@@ -159,7 +160,7 @@ def test_partial_relevance_keeps_only_relevant(base_state):
 def test_rewrite_then_hit(base_state):
     """先判不相关 -> 改写 -> 再检索命中 -> 正常作答（恢复路径）。"""
     retriever = FakeRetriever()
-    app = build_graph(model=_model(relevance_mode="after_rewrite"), retriever=retriever)
+    app = build_graph(model=_model(relevance_mode="after_rewrite"), retriever=retriever, checkpointer=InMemorySaver())
     result = app.invoke(base_state, config={"configurable": {"thread_id": "test"}, "recursion_limit": 20})
 
     assert result["rewrites"] == 1
@@ -171,7 +172,7 @@ def test_rewrite_then_hit(base_state):
 def test_rewrite_exhausted_falls_back(base_state):
     """始终不相关 -> 改写到 max_rewrites 上限 -> 兜底改为用模型自有知识作答（不再硬拒答）。"""
     retriever = FakeRetriever()
-    app = build_graph(model=_model(relevance_mode="none"), retriever=retriever)
+    app = build_graph(model=_model(relevance_mode="none"), retriever=retriever, checkpointer=InMemorySaver())
     result = app.invoke(base_state, config={"configurable": {"thread_id": "test"}, "recursion_limit": 20})
 
     assert result["rewrites"] == settings.max_rewrites

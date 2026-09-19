@@ -1,11 +1,12 @@
-# 删除对话 + 会话持久化（P1）设计文档
+ # 删除对话 + 会话持久化（P1）设计文档
 
 - **日期**：2026-09-13
-- **状态**：设计已确认，待实现
+- **状态**：设计已确认；后端已实现（2026-09-16 修订：checkpointer 改为 `AsyncSqliteSaver`，见下），前端待接入
 - **阶段**：P1（三阶段规划的第一阶段；P2 账号体系、P3 会话列表 + 知识库按用户隔离，均不在本 spec 范围）
 - **分工**：后端由用户实现；接口契约与前端由 AI 产出
 - **关联文档**：`2026-09-09-langchain-qa-web-design.md`（全栈骨架与聊天契约）、`2026-09-11-kb-upload-design.md`（知识库上传）
 - **前置结论**：`langgraph-checkpoint 4.2.0` 的 `BaseCheckpointSaver` 声明 `delete_thread`/`adelete_thread`（`base/__init__.py:320,511`），`InMemorySaver` 已实现（`memory/__init__.py:505-521,602-611`）；官方文档 `data/langchain_docs/langgraph/add-memory.md:1691-1696` 将 `checkpointer.delete_thread(thread_id)` 列为通用接口
+- **修订（2026-09-16）**：决策 2 的 checkpointer 由同步 `SqliteSaver` 改为 **`AsyncSqliteSaver`** —— 同步 saver 与 `graph.astream` 实测不可共存（langgraph 异步执行器无条件 `await checkpointer.aget_tuple`，同步 saver 的异步方法直接 `raise NotImplementedError`），SSE 流式路径全断；`aiosqlite` 已随 `langgraph-checkpoint-sqlite` 传递安装，`requirements.txt` 已显式声明。下文各章节已按此修订。
 
 ---
 
@@ -42,7 +43,7 @@
 | # | 决策 | 选择 | 被否决的方案与理由 |
 |---|---|---|---|
 | 1 | 功能范围 | **单会话删除** | ✗ 多会话侧栏：OSS LangGraph 不提供线程管理能力（`checkpointers.md:37` 明示创建/管理 thread 的端点属 LangSmith / Agent Server 平台层），`get_state_history` 只能查单个 thread（`checkpointers.md:160`），`checkpointer.list(None)` 返回的是 checkpoint 流而非会话列表；内存态下做出来的列表是假的<br>✗ 把「新对话」升级为「删除并新建」：用户失去「开新的但保留旧的」语义 |
-| 2 | checkpointer | **`SqliteSaver`（同步，官方）** | ✗ `AIOMySQLSaver`：第三方包 `langgraph-checkpoint-mysql` 2.0.15（官方列表 `checkpointers.md:277-279` 只有 sqlite/postgres/mongodb），要求 MySQL ≥ 8.0.19 或 MariaDB ≥ 10.7.1；2.x 时代产物与 `langgraph-checkpoint 4.2.0` 的 blob 分离存储（`memory/__init__.py:78-83`）存在兼容风险；异步 saver 还需把 `@lru_cache` 同步单例改成 FastAPI lifespan 初始化<br>✗ `PostgresSaver`：官方生产推荐，但本地无 PG 实例，需新装服务 |
+| 2 | checkpointer | **`AsyncSqliteSaver`（官方，`langgraph.checkpoint.sqlite.aio`）**（2026-09-16 修订，原选同步 `SqliteSaver`） | ✗ 同步 `SqliteSaver`（初版选择，实测否决）：与 `graph.astream` 不可共存——langgraph 异步执行器无条件 `await checkpointer.aget_tuple`（`pregel/_loop.py:1912`），同步 saver 的异步方法直接 `raise NotImplementedError`，SSE 流式聊天全断（`tests/test_chat_stream.py` 7 个用例全挂为证）<br>✗ `AIOMySQLSaver`：第三方包 `langgraph-checkpoint-mysql` 2.0.15（官方列表 `checkpointers.md:277-279` 只有 sqlite/postgres/mongodb），要求 MySQL ≥ 8.0.19 或 MariaDB ≥ 10.7.1；2.x 时代产物与 `langgraph-checkpoint 4.2.0` 的 blob 分离存储（`memory/__init__.py:78-83`）存在兼容风险<br>✗ `PostgresSaver`：官方生产推荐，但本地无 PG 实例，需新装服务 |
 | 3 | 端点形态 | **`DELETE /api/chat/threads/{thread_id}`**（path param） | ✗ query param：与 KB 的 `DELETE /api/kb/documents/{doc_id}` 不一致；且 P3 需要 `GET /api/chat/threads`（列表）与 `PATCH .../{id}`（重命名），现在用 `threads` 资源名铺路 |
 | 4 | 未知 thread_id 语义 | **`200 {deleted:false}`（幂等）** | ✗ `404 NOT_FOUND`（KB DELETE 的做法）：**id 来源不同**——KB 的 `doc_id` 来自服务端列表，删不到是真异常；chat 的 `thread_id` 由前端本地随机生成，清 localStorage / 换浏览器 / 多标签页重复点都会导致「不存在」，404 会变成噪音。DELETE 本身是幂等方法 |
 | 5 | 响应体字段 | **`{thread_id, deleted}`** | ✗ 加 `deleted_messages` 计数：`delete_thread` 返回 `None`，要计数得先 `get_state` 多一次 IO，且前端用不上 |
@@ -61,7 +62,7 @@ sequenceDiagram
     participant C as useChat
     participant API as client.deleteThread
     participant BE as FastAPI
-    participant CP as SqliteSaver
+    participant CP as AsyncSqliteSaver
     U->>H: 点「🗑 删除对话」
     H->>D: open = true
     U->>D: 点「删除」
@@ -70,8 +71,8 @@ sequenceDiagram
     C->>C: await 流真正结束（防残行）
     C->>API: deleteThread(threadId)
     API->>BE: DELETE /api/chat/threads/{id}
-    BE->>CP: get_tuple(config) 判断是否存在
-    BE->>CP: delete_thread(id)
+    BE->>CP: alist(config, limit=1) 探测存在性
+    BE->>CP: await adelete_thread(id)
     CP-->>BE: None
     BE-->>API: 200 {thread_id, deleted}
     API-->>C: ChatDeleteResponse
@@ -115,7 +116,7 @@ DELETE /api/chat/threads/{thread_id}
 | `thread_id` | string | 是 | 回显请求路径中的 id |
 | `deleted` | boolean | 是 | **删除前**该 thread 是否存在至少一个 checkpoint。`false` 表示本来就不存在（幂等，非错误） |
 
-`deleted` 的判定方式（`delete_thread` 返回 `None`，拿不到结果）：删除前先 `checkpointer.get_tuple(config)`，`deleted = tuple is not None`。
+`deleted` 的判定方式（`adelete_thread` 返回 `None`，拿不到结果）：删除前先 `await checkpointer.alist(config, limit=1)` 取第一条判断存在性（`deleted = 第一条 is not None`），再 `await checkpointer.adelete_thread(thread_id)`。先探测还有个附带作用：`alist` 内部会惰性 `setup()` 建表，保证「从未写过任何会话的新库」上直接 DELETE 不报 `no such table`。
 
 ### 5.3 错误码
 
@@ -173,44 +174,48 @@ uv add langgraph-checkpoint-sqlite
 
 ```python
     # 会话状态（LangGraph checkpoint）落盘处。InMemorySaver 重启即失，
-    # 换 SqliteSaver 后「删除对话」才有意义、历史才能跨重启存活。
+    # 换持久化 checkpointer（AsyncSqliteSaver）后「删除对话」才有意义、历史才能跨重启存活。
     checkpoint_db: Path = data_dir / "checkpoints.db"
 ```
 
-### 6.2 checkpointer 替换（四个必须遵守的约束）
+### 6.2 checkpointer 替换（修订版：AsyncSqliteSaver + 四个必须遵守的约束）
 
 `graph.py` 改造要点：
 
 ```python
-import sqlite3
-from langgraph.checkpoint.sqlite import SqliteSaver
+import aiosqlite
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 @lru_cache(maxsize=1)
-def get_checkpointer():
-    """SQLite checkpointer 单例。约束 ①②③ 见下方注释（第 ④ 条在 build_graph），缺一即出问题。"""
-    # ① 不能用 `with SqliteSaver.from_conn_string(path)`：它是上下文管理器，
-    #    在 @lru_cache 函数里 with 会在函数返回时关掉连接，后续请求全部报错。
-    # ② check_same_thread=False 必须加：FastAPI 会把同步 checkpointer 操作
-    #    丢进线程池执行，不加会报 "SQLite objects created in a thread can only
-    #    be used in that same thread"。
-    conn = sqlite3.connect(str(settings.checkpoint_db), check_same_thread=False)
-    saver = SqliteSaver(conn)
-    # ③ 首次使用必须 setup() 建表（官方 add-memory.md:1698-1704：
-    #    DB-backed saver 需先跑迁移）。该调用幂等，每次启动执行即可。
-    saver.setup()
-    return saver
+def get_checkpointer() -> AsyncSqliteSaver:
+    """AsyncSqliteSaver 单例。约束 ①②③ 见下方注释（第 ④ 条在 build_graph），缺一即出问题。"""
+    # ① 不用 `from_conn_string` 的 async with：退出即关连接，而单例要活到进程结束；
+    #    手动 aiosqlite.connect 建连接，由 lru_cache 单例持有。
+    # ② 必须在运行中的事件循环里构造 —— __init__ 会捕获 get_running_loop() 存 self.loop，
+    #    所以只能由异步上下文首次触发（uvicorn 请求期 / CLI 的 asyncio.run）；
+    #    模块顶层或纯同步上下文构造会 RuntimeError。同步 CLI（run.py）因此必须整体
+    #    跑进 asyncio.run（ainvoke/astream）；print_ascii_graph 与持久化无关，
+    #    在同步上下文里显式传 InMemorySaver() 占位。
+    # ③ 建表是惰性的：aget_tuple / alist 首次调用会 await setup()（幂等），无需手动 setup()。
+    settings.checkpoint_db.parent.mkdir(parents=True, exist_ok=True)
+    return AsyncSqliteSaver(aiosqlite.connect(str(settings.checkpoint_db)))
 
 
 def build_graph(model=None, retriever=None, checkpointer=None):
     """构建并编译 RAG 工作流。model/retriever/checkpointer 均可注入用于测试。"""
     ...
-    # ④ 默认走 SQLite 单例；测试必须显式传 InMemorySaver，见 §6.3
+    # ④ 默认走异步单例；测试必须显式传 InMemorySaver，见 §6.3
     return b.compile(checkpointer=checkpointer or get_checkpointer())
 ```
 
+**两个异步化的连带约束**（实测踩过：不遵守其一，要么事件循环里直接抛异常，要么进程退不出）：
+
+1. **同步桥接方法只允许跨线程调用**：`AsyncSqliteSaver` 也实现了 `get_tuple/delete_thread` 等同步版，但它们在**事件循环线程上调用会直接抛 `InvalidStateError`**（内部靠 `run_coroutine_threadsafe` 回投，前提是「别的线程调」）。服务层一律 `await` 异步版（`aget_state` / `alist` / `adelete_thread`），不要再 `asyncio.to_thread`。
+2. **进程收尾必须 close 连接**：aiosqlite 的工作线程是**非 daemon** 的（`aiosqlite/core.py:90`），只有 `conn.close()` 会入队退出哨兵（`_STOP_RUNNING_SENTINEL`）；不关的话 CLI 跑完进程不退出、uvicorn Ctrl+C 不退出。`graph.py` 提供 `aclose_checkpointer()`（close + `cache_clear`，兼顾同进程多次 `asyncio.run`），由 `run.py` 的 `asyncio.run` 收尾与 `api/main.py` 的 lifespan shutdown 调用。
+
 **顺带修掉一处死代码**：现有签名 `build_graph(model=None, retriever=None, thread_id=None)`（`graph.py:201`）中的 `thread_id` **从未被使用**，直接替换为 `checkpointer=None`。
 
-`get_graph()`（`graph.py:231-233`）保持 `@lru_cache` 不变，注释更新为「SqliteSaver 跨请求、跨重启保留 thread 状态」。
+`get_graph()`（`graph.py:231-233`）保持 `@lru_cache` 不变，注释更新为「checkpointer 单例跨请求保留 thread 状态」。
 
 ### 6.3 测试注入要求（不做会污染真实数据库）
 
@@ -219,7 +224,7 @@ def build_graph(model=None, retriever=None, checkpointer=None):
 - `tests/test_graph.py:130, 140, 151, 162, 174`
 - `tests/test_chat_stream.py:51`
 
-若 §6.2 的默认值变成 `SqliteSaver`，**这 32 个测试会全部写入真实 `data/checkpoints.db` 并因 thread_id 相同而互相污染**。因此必须：
+若 §6.2 的默认值变成异步单例，**这些测试会全部写入真实 `data/checkpoints.db` 并因 thread_id 相同而互相污染**（且同步测试上下文里根本无法构造 `AsyncSqliteSaver`）。因此必须：
 
 ```python
 # 每个 build_graph 调用点补上 checkpointer=InMemorySaver()
@@ -231,31 +236,44 @@ app = build_graph(model=..., retriever=..., checkpointer=InMemorySaver())
 
 新增的删除测试用 `monkeypatch.setattr(chat_service, "get_graph", ...)`（沿用 `tests/test_chat_stream.py:53` 的既有手法），或 `monkeypatch.setattr` 替换 `get_checkpointer`，避免碰真实 db 文件。
 
-### 6.4 服务层与路由
+### 6.4 服务层与路由（最终实现）
 
-`services/chat_service.py` 新增：
+`services/chat_service.py`（历史与删除都走原生异步，不再 `asyncio.to_thread`）：
 
 ```python
-async def delete_chat_thread(thread_id: str) -> dict:
-    """删除一个会话的全部 checkpoint。幂等：不存在也返回 200 + deleted=False。"""
+async def get_chat_history(thread_id: str) -> HistoryResponse:
     graph = get_graph()
     config = {"configurable": {"thread_id": thread_id}}
-    # delete_thread 返回 None，拿不到"是否真删了"，所以先探测存在性
-    existed = await asyncio.to_thread(graph.checkpointer.get_tuple, config) is not None
-    # SQLite 操作是阻塞的，丢线程池，别卡住事件循环
-    await asyncio.to_thread(graph.checkpointer.delete_thread, thread_id)
-    return {"thread_id": thread_id, "deleted": existed}
+    state = await graph.aget_state(config)   # AsyncSqliteSaver 原生异步
+    ...
+
+
+async def delete_chat_thread(thread_id: str) -> ChatDeleteResponse:
+    """删除一个会话的全部 checkpoint。幂等：不存在也返回 deleted=False。"""
+    checkpointer = get_graph().checkpointer
+    config = {"configurable": {"thread_id": thread_id}}
+    # 先探测存在性；alist 会惰性 setup 建表（空库直接 DELETE 会报 no such table）
+    agen = checkpointer.alist(config, limit=1)
+    try:
+        existed = await anext(agen, None) is not None
+    finally:
+        await agen.aclose()   # 只取一条就中断：挂起的生成器持锁，等 GC 会卡并发写入
+    await checkpointer.adelete_thread(thread_id)
+    return ChatDeleteResponse(thread_id=thread_id, deleted=existed)
 ```
+
+返回模型用 Pydantic `ChatDeleteResponse`（`agent/schemas.py`，组件名与 `openapi.yaml` 的 `ChatDeleteResponse` 对齐）。
 
 `api/chat_router.py` 新增：
 
 ```python
-@router.delete("/threads/{thread_id}")
-async def delete_thread(thread_id: str):
+@router.delete("/threads/{thread_id}", response_model=ChatDeleteResponse)
+async def delete_chat(thread_id: str):
+    """…幂等：未知/已删过的 thread_id 返回 deleted=false（非 404）。"""
     return await chat_service.delete_chat_thread(thread_id)
 ```
 
-（`thread_id` 用 `str` 而非 `UUID`，与现有 `GET /history` 一致；错误体如需自定义，用 `JSONResponse` 而非 `HTTPException`，因为契约要 `{code, message}` 不是 `{detail}`。）
+（`thread_id` 用 `str` 而非 `UUID`，与现有 `GET /history` 一致；`GET /history` 路由同样需要 `await` 服务层。）
 
 ### 6.5 `.gitignore`
 
@@ -465,7 +483,7 @@ const [confirmDelete, setConfirmDelete] = useState(false);
 | **P2 账号体系** | `users` 表（MySQL）、注册/登录、JWT（`pyjwt` 目前是 `mcp` 的传递依赖，需显式声明）、`get_current_user` 依赖、401 语义；前端登录页 + token 存储 + 401 拦截 |
 | **P3 会话列表 + KB 隔离** | `conversations` 索引表（MySQL：`thread_id` PK、`user_id` FK、`title`、时间戳）、侧栏 UI、切换/重命名；KB 的 metadata 加 `user_id` + 检索过滤 + 归属校验 + 现有 20 个上传文件的归属迁移策略 |
 | **越权风险（P2 解决）** | 当前 `GET /api/chat/history?thread_id=X` 与新 `DELETE /api/chat/threads/{X}` 均无鉴权，猜到 uuid 即可读/删他人会话。P1 不引入鉴权，但契约里必须记录此已知风险 |
-| **SQLite 并发上限** | 单文件 + 写锁，多 worker 部署会锁库。届时按官方建议迁 `PostgresSaver`（`persistence.md:67-70`），接口不变（`delete_thread` 是 saver 通用接口） |
+| **SQLite 并发上限** | 单文件 + 写锁，多 worker 部署会锁库。届时按官方建议迁 `PostgresSaver`（`persistence.md:67-70`），接口不变（`delete_thread`/`adelete_thread` 是 saver 通用接口） |
 | **checkpoint 无限增长** | 长对话会累积大量 checkpoint 行（`persistence.md:72-84`）。P1 靠手动删除；后续可加保留策略。注意 `InMemorySaver 4.2.0` **未实现** `prune`/`copy_thread`/`delete_for_runs`（基类 `raise NotImplementedError`），不可调用 |
 
 ## 11. 顺带发现的既有不一致（本期不修，仅记录）

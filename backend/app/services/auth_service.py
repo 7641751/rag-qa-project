@@ -14,7 +14,7 @@ _LOGIN_FAILED = "用户名或密码错误"
 async def register(db: AsyncSession, *, username: str, password: str)->AuthUser:
     existing = await db.scalar(select(User.id).where(User.username == username))
     if existing is not None:
-        api_error(409, "BAD_REQUEST", "用户名已存在")
+        api_error(409, "USERNAME_TAKEN", "用户名已存在")
 
     user = User(username=username, password_hash=hash_password(password))
 

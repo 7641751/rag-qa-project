@@ -5,6 +5,7 @@
 
 """
 import argparse
+import asyncio
 import os
 import sys
 from pathlib import Path
@@ -21,18 +22,33 @@ os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
 
 def ask(question: str, mode: str = "normal"):
+    # AsyncSqliteSaver 构造需要运行中的事件循环，CLI 整体跑进 asyncio.run；
+    # 收尾必须 close 掉 checkpointer 连接 —— aiosqlite 工作线程非 daemon，不关进程退不出去
+    return asyncio.run(_ask_and_close(question, mode))
+
+
+async def _ask_and_close(question: str, mode: str = "normal"):
+    from backend.app.agent.graph import aclose_checkpointer
+
+    try:
+        return await _ask(question, mode)
+    finally:
+        await aclose_checkpointer()
+
+
+async def _ask(question: str, mode: str = "normal"):
     from backend.app.agent.graph import build_graph
 
     app = build_graph()
     state = {"question": question, "documents": [], "generation": "",
              "rewrites": 0}
+    config = {"configurable": {"thread_id": "cli"}, "recursion_limit": 20}
 
     if mode == "stream":
         # 流式：LLM token 实时输出（updates + messages 双模式）
         print("回答: ", end="", flush=True)
-        for chunk_mode, chunk in app.stream(
-                state, config={"configurable": {"thread_id": "cli"}, "recursion_limit": 20},
-                stream_mode=["updates", "messages"]):
+        async for chunk_mode, chunk in app.astream(
+                state, config=config, stream_mode=["updates", "messages"]):
             if chunk_mode == "messages":
                 msg, _meta = chunk
                 content = getattr(msg, "content", None)
@@ -43,8 +59,8 @@ def ask(question: str, mode: str = "normal"):
 
     if mode == "debug":
         # 调试：每个节点执行完打印状态增量
-        for update in app.stream(state, config={"configurable": {"thread_id": "cli"}, "recursion_limit": 20},
-                                 stream_mode="updates"):
+        async for update in app.astream(state, config=config,
+                                        stream_mode="updates"):
             for node, delta in update.items():
                 if node == "__end__":
                     continue
@@ -55,7 +71,7 @@ def ask(question: str, mode: str = "normal"):
                     print(f"   {k}: {summary}")
         return None
 
-    result = app.invoke(state, config={"configurable": {"thread_id": "cli"}, "recursion_limit": 20})
+    result = await app.ainvoke(state, config=config)
     return result["generation"]
 
 

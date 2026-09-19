@@ -8,9 +8,11 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_DIR = Path(__file__).resolve().parent
+
 
 # 每个入口（run.py / ingest.py / uvicorn）都会 import config，所以 .env 在这里统一加载一次。
 # pydantic-settings 的 env_file 只喂给 Settings 模型，**不会写进 os.environ**，
@@ -30,6 +32,21 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    @model_validator(mode="after")
+    def _require_jwt_secret(self):
+        secret = (self.jwt_secret or "").strip()
+        if not secret:
+            raise ValueError(
+                "RAGQA_JWT_SECRET 未设置。请在仓库根的 .env（rag_qa_project 的上一级）里加一行 "
+                "RAGQA_JWT_SECRET=<openssl rand -hex 32 的输出>")
+        if len(secret.encode("utf-8")) < 32:
+            # HS256 的 HMAC 密钥要 ≥ 32 字节，否则 PyJWT 会在每次 encode/decode
+            # 发 InsecureKeyLengthWarning（RFC 7518 §3.2）。在启动期拦掉更省事。
+            raise ValueError(
+                "RAGQA_JWT_SECRET 太短：HS256 要求 ≥ 32 字节（RFC 7518 §3.2）。"
+                "请用 openssl rand -hex 32 生成（64 个字符）")
+        return self
+
     # ---- LLM（DeepSeek）----
     deepseek_model: str = "deepseek-chat"
     temperature: float = 0.1          # RAG 场景用低温度，减少编造
@@ -37,6 +54,9 @@ class Settings(BaseSettings):
     # ---- 嵌入（本地 bge，离线可用）----
     embed_model: str = "qwen3.7-text-embedding"
     hf_endpoint: str = "https://hf-mirror.com"   # 国内镜像
+
+    # ---- 重排 ----
+    rerank_model: str = "qwen3.7-text-rerank"
 
     # ---- 检索 ----
     top_k: int = 4                    # 每次检索返回的文档数
@@ -56,6 +76,15 @@ class Settings(BaseSettings):
     # 用户上传的原件落盘处：向量库是可重建的派生数据，ingest.py --force 重建时
     # 要靠这里的原件把用户文档捞回来，否则一次重建 = 用户资料永久丢失。
     uploads_dir: Path = data_dir / "uploads"
+    checkpoint_db: Path = data_dir / "checkpoints.db"
 
+    # ---- 数据库 ----
+    mysql_database_url: str = ""  # 由 .env 的 RAGQA_MYSQL_DATABASE_URL 注入
+    sql_echo: bool = False
+
+    # ---- 鉴权 ----
+    jwt_secret: str = ""  # 必填；为空则启动即失败（见下）
+    jwt_algorithm: str = "HS256"
+    jwt_expire_days: int = 7
 
 settings = Settings()

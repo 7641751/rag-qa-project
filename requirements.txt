@@ -13,6 +13,9 @@ python-dotenv>=1.0
 pytest>=8.0
 python-multipart
 pypdf>=5.0                 # function_tools.parse_and_split 解析 PDF（PdfReader 需包 BytesIO）
+langgraph-checkpoint-sqlite
+aiosqlite>=0.22             # graph.py 直接 import（AsyncSqliteSaver 的异步连接层；此前仅是传递依赖）
+bcrypt
 
 # ↓ 后端(Web)：api/main.py、chat_router.py 直接 import fastapi（同理会告警）
 fastapi>=0.115

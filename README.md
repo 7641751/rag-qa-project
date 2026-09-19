@@ -357,6 +357,8 @@ data: {"doc_id": "d68ae53c-...", "filename": "notes.md", "chunks": 1,
 | `chroma_dir` | `data/chroma_db` | `RAGQA_CHROMA_DIR` | 向量库持久化目录 |
 | `docs_dir` | `data/langchain_docs` | `RAGQA_DOCS_DIR` | 预置文档目录 |
 | `uploads_dir` | `data/uploads` | `RAGQA_UPLOADS_DIR` | 用户上传原件落盘处 |
+| `mysql_database_url` | `""`（未配置） | `RAGQA_MYSQL_DATABASE_URL` | MySQL 异步连接串（P2 账号体系用）。默认空串 → 构造引擎前快速失败并点名该变量；**口令只放 .env，不进源码** |
+| `sql_echo` | `False` | `RAGQA_SQL_ECHO` | 是否打印全部 SQL。SSE 场景下默认关，否则 SQL 日志会淹没应用日志 |
 
 例：`RAGQA_TOP_K=6 python run.py "年假有几天？"`
 
@@ -394,13 +396,13 @@ npm run build                      # tsc --noEmit + vite build，产物 ~497 KB 
 ```python
 # ✅ 正确
 from backend.app.agent.graph import get_vectorstore
-from backend.app.function_tools import sse, err
+from backend.tools.upload_function_tools import sse, err
 from config import settings
 
-# ❌ 错误 —— 运行时 ModuleNotFoundError: No module named 'agent'
+# ❌ 错误 —— 运行时 ModuleNotFoundError（tools 物理在 backend/tools/，源根底下找不到它）
 from agent.graph import get_vectorstore
 from services.upload_service import sse_upload
-from function_tools import sse
+from tools.upload_function_tools import sse
 ```
 
 判别方法：**把 import 的第一段拿去 `rag_qa_project/` 底下找，找得到就合法，找不到就是根错了。**
