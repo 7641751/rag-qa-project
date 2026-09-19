@@ -31,7 +31,7 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.checkpoint.memory import InMemorySaver
 
 from config import settings
-from backend.app.agent.graph import _decide_to_generate, _make_nodes, build_graph
+from backend.app.agent.graph import _decide_to_generate, _make_nodes, build_graph, kb_filter
 
 
 # ============================ 测试替身（Fakes） ============================
@@ -255,3 +255,45 @@ def test_decide_to_generate_branches():
     assert _decide_to_generate({"documents": [], "rewrites": 0}) == "rewrite"
     assert _decide_to_generate(
         {"documents": [], "rewrites": settings.max_rewrites}) == "generate"
+
+
+# ============================ 5. 检索按用户过滤（P3） ============================
+def test_retrieve_filter_with_user_id():
+    """P3 §5.2：有 user_id → 预置文档 + 本人上传件。"""
+    vs = FakeVectorStore()
+    retrieve, _, _, _ = _make_nodes(_model(), vs)
+
+    retrieve({"question": "q", "documents": [], "generation": "", "rewrites": 0, "user_id": 7})
+
+    assert vs.calls[0]["filter"] == {"$or": [{"kb": "langchain_docs"}, {"user_id": 7}]}
+    assert vs.calls[0]["k"] == settings.top_k
+
+
+def test_retrieve_filter_without_user_id():
+    """P3 §5.2：无 user_id（CLI / 未登录）→ 只见预置文档。
+
+    断言的是**裸条件**而不是 {"$or": [{"kb": ...}]} —— 后者会让 Chroma 抛
+    ValueError（$or 至少要两个子条件，spec §5.2 与 upload_function_tools.py:17-18）。
+    """
+    vs = FakeVectorStore()
+    retrieve, _, _, _ = _make_nodes(_model(), vs)
+
+    retrieve({"question": "q", "documents": [], "generation": "", "rewrites": 0})
+
+    assert vs.calls[0]["filter"] == {"kb": "langchain_docs"}
+    assert "$or" not in vs.calls[0]["filter"]
+
+
+def test_kb_filter_never_uses_origin_builtin():
+    """钉住 spec §5.1 的纠错：预置文档**没有 `origin` 字段**。
+
+    设计初稿写的是 {"$or":[{"origin":"builtin"},{"user_id":X}]}。若按那样实现，
+    88 篇官方文档会全部从检索结果里消失，**且不报任何错** —— 问答质量断崖下跌却无人
+    察觉（这正是它值得一条专门测试的原因）。正确的标记字段是 `kb`。
+    """
+    for uid in (None, 7):
+        cond = json.dumps(kb_filter(uid))
+        assert "origin" not in cond, (
+            f"过滤条件里出现了 origin={cond}；预置文档没有 origin 字段，"
+            "用它过滤会让 88 篇官方文档全部消失，应该用 kb")
+        assert "langchain_docs" in cond
