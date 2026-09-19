@@ -1,7 +1,8 @@
+from datetime import UTC, datetime
 from typing import TypedDict, Annotated
 
 from langgraph.graph import add_messages
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_serializer, field_validator
 
 """agent 相关的 Schema"""
 
@@ -13,7 +14,7 @@ class RAGState(TypedDict):
     generation: str
     rewrites: int # 已重写次数
     messages: Annotated[list, add_messages]  # 累积对话历史
-
+    user_id: int | None    # 由 chat_service 从 token 注入；CLI / 测试可为 None
 
 # ---------- 结构化输出 Schema ----------
 # 注意：Field(description=...) 会进入发给模型的 JSON schema，等同于半条提示词，
@@ -94,6 +95,66 @@ class AuthUser(BaseModel):
     """鉴权响应里的用户信息（契约 components.schemas.AuthUser）。"""
     id: int = Field(description="用户 ID")
     username: str = Field(description="用户名")
+
+
+# ---------- 会话列表（P3） ----------
+# title 的真实上限来自 DB 列宽（models.Conversation.title 是 String(60)），
+# 这里复述一份用于 422 的前置拦截。改列宽时两处都要改。
+RENAME_MAX_CHARS = 60
+
+
+class ConversationSummary(BaseModel):
+    """会话列表项（契约 components.schemas.ConversationSummary）。"""
+    thread_id: str = Field(description="会话 ID")
+    title: str = Field(description="标题：首问前 20 字，之后可由用户手动重命名")
+    created_at: datetime = Field(description="创建时间")
+    updated_at: datetime = Field(description="最后一次提问时间；列表按它倒序")
+
+    @field_serializer("created_at", "updated_at")
+    def _iso8601_utc_z(self, v: datetime) -> str:
+        """序列化成**带 Z** 的 ISO 8601。
+
+        库里存的是 naive UTC（MySQL DATETIME 不带时区，写入值是 datetime.now(UTC)），
+        Pydantic 默认会输出 `2026-09-19T06:00:00` —— **没有 Z**。而按 ECMAScript 规范，
+        JS 的 `new Date('2026-09-19T06:00:00')` 把这种形式解析成**本地时间**，于是
+        UTC 时间戳被当成本地时间，前端的相对时间整体偏掉一个时区（UTC+8 下
+        「刚刚」会显示成「8 小时前」）。契约样例与前端 mock 都带 Z，这里补齐。
+        """
+        if v.tzinfo is None:
+            v = v.replace(tzinfo=UTC)
+        return v.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class ThreadListResponse(BaseModel):
+    """GET /api/chat/threads 响应（契约 components.schemas.ThreadListResponse）。"""
+    threads: list[ConversationSummary]
+    total: int = Field(
+        description="本人会话的**真实总数**。threads 最多 50 条，total 更大即被截断")
+
+
+class RenameRequest(BaseModel):
+    """PATCH /api/chat/threads/{thread_id} 请求体（契约 components.schemas.RenameRequest）。"""
+    title: str = Field(description="新标题", min_length=1, max_length=RENAME_MAX_CHARS)
+
+    @field_validator("title")
+    @classmethod
+    def _strip_then_require_non_empty(cls, v: str) -> str:
+        """去空白后判空，并**返回去空白后的值**。
+
+        `min_length=1` 只挡得住空串：`"   "` 能通过校验，但它存进去就是一个
+        「看起来是空的」标题。返回 stripped 值而不是原值，否则库里留下 `"  x  "`，
+        列表里看着像有缩进。
+        """
+        s = v.strip()
+        if not s:
+            raise ValueError("标题不能为空")
+        return s
+
+
+class RenameResponse(BaseModel):
+    """PATCH /api/chat/threads/{thread_id} 响应（契约 components.schemas.RenameResponse）。"""
+    thread_id: str
+    title: str
 
 
 class LoginResponse(BaseModel):

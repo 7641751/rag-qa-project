@@ -8,7 +8,10 @@ import json
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.app.agent.schemas import ChatRequest, RAGState, HistoryResponse, HistoryMessage, ChatDeleteResponse
+from backend.app.agent.schemas import (
+    ChatRequest, RAGState, HistoryResponse, HistoryMessage, ChatDeleteResponse,
+    ConversationSummary, ThreadListResponse, RenameResponse,
+)
 from backend.app.agent.graph import build_graph, get_graph
 from backend.app.services import conversation_service
 
@@ -138,6 +141,28 @@ async def delete_chat_thread(thread_id: str, user_id: int,
     await conversation_service.delete_conversation_row(db, thread_id)
     await db.commit()
     return ChatDeleteResponse(thread_id=thread_id, deleted=existed)
+
+async def list_chat_threads(user_id: int, db: AsyncSession) -> ThreadListResponse:
+    """当前用户的会话列表（对齐契约 §7.1）。
+
+    只做「ORM 行 → 契约模型」的搬运，排序 / 上限 / total 口径都在
+    conversation_service.list_conversations 里，本层不再重复判断。
+    """
+    rows, total = await conversation_service.list_conversations(db, user_id)
+    return ThreadListResponse(
+        threads=[ConversationSummary(thread_id=r.thread_id, title=r.title,
+                                     created_at=r.created_at, updated_at=r.updated_at)
+                 for r in rows],
+        total=total)
+
+
+async def rename_chat_thread(thread_id: str, user_id: int, title: str,
+                             db: AsyncSession) -> RenameResponse:
+    """重命名会话。403（非本人）与 404（不存在）由服务层 api_error 抛出，
+    路由不加 try —— 异常经 errors.py 的处理器统一转成契约错误体。"""
+    row = await conversation_service.rename_conversation(db, thread_id, user_id, title)
+    return RenameResponse(thread_id=row.thread_id, title=row.title)
+
 
 async def prepare_stream(chat_request: ChatRequest, user_id: int,
                          db: AsyncSession):

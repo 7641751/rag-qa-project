@@ -5,7 +5,10 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.app.agent.schemas import AuthUser, ChatDeleteResponse, ChatRequest
+from backend.app.agent.schemas import (
+    AuthUser, ChatDeleteResponse, ChatRequest,
+    RenameRequest, RenameResponse, ThreadListResponse,
+)
 from backend.app.api.deps import get_current_user
 from backend.app.services import chat_service
 from backend.tools.mysql_db_tools import get_db_session
@@ -34,6 +37,27 @@ async def stream_chat(chat_request: ChatRequest, user: CurrentUser, db: DbSessio
 async def get_chat_history(thread_id: str, user: CurrentUser, db: DbSession):
     """聊天历史。无行 → 200 空数组（既有约定，前端新会话依赖它）；非本人 → 403。"""
     return await chat_service.get_chat_history(thread_id, user.id, db)
+
+
+@router.get("/threads", response_model=ThreadListResponse)
+async def list_chat_threads(user: CurrentUser, db: DbSession):
+    """当前用户的会话列表，按 `updated_at` 倒序、最多 50 条（P3 §7.1）。
+
+    只返回本人的：查询走 `ix_conversations_user_updated (user_id, updated_at DESC)`。
+    空列表返回 `200 {threads:[], total:0}`，**不是 404** —— 新用户进来就是这个状态。
+    """
+    return await chat_service.list_chat_threads(user.id, db)
+
+
+@router.patch("/threads/{thread_id}", response_model=RenameResponse)
+async def rename_chat_thread(thread_id: str, body: RenameRequest,
+                             user: CurrentUser, db: DbSession):
+    """重命名会话（P3 §7.1）。
+
+    失败：非本人 → 403、不存在 → 404、标题空/纯空格/超 60 字 → 422
+    （最后一条由 RenameRequest 在进入服务层之前就拦掉）。
+    """
+    return await chat_service.rename_chat_thread(thread_id, user.id, body.title, db)
 
 
 @router.delete("/threads/{thread_id}", response_model=ChatDeleteResponse)
