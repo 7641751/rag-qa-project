@@ -1,0 +1,183 @@
+{
+  "_comment": [
+    "检索离线评估集。24 条查询，三类各 8 条。",
+    "标注口径：expected_sources 写文档标识，命中 = top-k 里任一段来自其中之一。",
+    "  · 预置件用相对路径（如 langgraph/checkpointers.md），与 Chroma metadata 的 source 字段逐字相等；",
+    "  · 上传件用文件名（如 缓存雪崩.md），脚本按 source 的 '__' 后半段精确匹配。",
+    "note 字段记录标注理由，便于逐条否决。ambiguous=true 表示官方文档与上传件都能算对。",
+    "所有 source 均已对着向量库真实清单核对（88 篇预置 + 21 个上传 source）。"
+  ],
+  "queries": [
+    {
+      "id": "term_en_01",
+      "type": "term_en",
+      "query": "How to configure check_same_thread when using SqliteSaver with FastAPI",
+      "expected_sources": ["langgraph/checkpointers.md", "langgraph/persistence.md"],
+      "note": "checkpointer 官方页（76 段）讲各 saver 用法；persistence（10 段）有 MemorySaver 不持久化的排障段。含 snake_case 标识符，是 BM25 的强项。"
+    },
+    {
+      "id": "term_en_02",
+      "type": "term_en",
+      "query": "GRAPH_RECURSION_LIMIT error how to fix",
+      "expected_sources": ["langgraph/errors/GRAPH_RECURSION_LIMIT.md"],
+      "note": "全大写错误码，只有那 2 段文档含它。纯 BM25 测试：向量检索对这种符号串通常很弱。"
+    },
+    {
+      "id": "term_en_03",
+      "type": "term_en",
+      "query": "MISSING_CHECKPOINTER error when calling get_state",
+      "expected_sources": ["langgraph/errors/MISSING_CHECKPOINTER.md", "langgraph/checkpointers.md"],
+      "note": "错误码专页（2 段）为主，checkpointers 页也会讲 get_state 需要 checkpointer。"
+    },
+    {
+      "id": "term_en_04",
+      "type": "term_en",
+      "query": "stream_mode updates versus messages difference",
+      "expected_sources": ["langgraph/streaming.md", "langgraph/event-streaming.md", "langchain/streaming.md"],
+      "note": "stream_mode 是 LangGraph 参数名，三篇都覆盖；langgraph/streaming.md（69 段）最对口。"
+    },
+    {
+      "id": "term_en_05",
+      "type": "term_en",
+      "query": "add_messages reducer annotation in StateGraph",
+      "expected_sources": ["langgraph/graph-api.md", "langgraph/add-memory.md"],
+      "note": "add_messages 是 API 名；graph-api（140 段）讲 reducer/Annotated，add-memory（112 段）讲 messages 通道。"
+    },
+    {
+      "id": "term_en_06",
+      "type": "term_en",
+      "query": "with_structured_output Pydantic response_format",
+      "expected_sources": ["langchain/structured-output.md"],
+      "note": "with_structured_output 专页（45 段）。camelCase + snake_case 混合，考 tokenizer 是否保完整标识符。"
+    },
+    {
+      "id": "term_en_07",
+      "type": "term_en",
+      "query": "Command goto handoff between agents",
+      "expected_sources": ["langchain/multi-agent/handoffs.md", "langchain/multi-agent/subagents.md"],
+      "note": "Command/goto 是 API 名，handoffs（27 段）与 subagents（38 段）都用它实现转交。"
+    },
+    {
+      "id": "term_en_08",
+      "type": "term_en",
+      "query": "interrupt function resume with Command payload",
+      "expected_sources": ["langgraph/interrupts.md", "langchain/human-in-the-loop.md"],
+      "note": "interrupt()/Command(resume=...) 是 API 名；interrupts（64 段）最对口。"
+    },
+
+    {
+      "id": "semantic_zh_01",
+      "type": "semantic_zh",
+      "query": "怎么让智能体记住用户的长期偏好",
+      "expected_sources": ["langgraph/stores.md", "langchain/long-term-memory.md", "concepts/memory.md", "第1节. Runtime.md", "langchain/context-engineering.md"],
+      "note": "长期记忆 = Store。【已根据实跑审计放宽】首轮评测时 dense 把上传件《第1节. Runtime.md》排在 top-1，其内容正是 key=learning_preferences 的 @tool 保存用户偏好实例，完全算对——原标注只列了三篇官方文档，属于标注过窄。context-engineering 为 borderline（讲上下文管理，间接相关）。"
+    },
+    {
+      "id": "semantic_zh_02",
+      "type": "semantic_zh",
+      "query": "程序崩溃后怎么从上次中断的地方继续跑",
+      "expected_sources": ["langgraph/fault-tolerance.md", "langgraph/checkpointers.md", "langgraph/use-functional-api.md", "langgraph/functional-api.md", "langgraph/interrupts.md"],
+      "note": "【已根据实跑审计放宽】首轮评测时 dense top-1 是 use-functional-api.md，snippet 为 '# Continue execution ... Command(resume=...)'，确实是「从中断处继续跑」；interrupts.md 讲暂停/恢复也算对。原标注只列 fault-tolerance + checkpointers，属于标注过窄。"
+    },
+    {
+      "id": "semantic_zh_03",
+      "type": "semantic_zh",
+      "query": "怎么在给出答案之前让人工审核一遍",
+      "expected_sources": ["langchain/human-in-the-loop.md", "langgraph/interrupts.md"],
+      "note": "human-in-the-loop 的中文说法；两篇都讲审批中断。【审计确认为真 MISS，标注保留不动】实跑召回的是上传件《第3节. Think In LangGraph.md》里的邮件客服 prompt 与意图识别分支，与「人工审核」无关——这是本评估集里唯一的真失败例，也是最有价值的一条：它说明问题是「查询→语料语义鸿沟」（该由 CRAG 的 rewrite_query 解决），而不是「缺一路稀疏检索」。"
+    },
+    {
+      "id": "semantic_zh_04",
+      "type": "semantic_zh",
+      "query": "多个智能体之间怎么互相转交任务",
+      "expected_sources": ["langchain/multi-agent/handoffs.md", "langchain/multi-agent/index.md", "langchain/multi-agent/subagents.md"],
+      "note": "handoff 的中文表述。三篇都是多智能体协作。"
+    },
+    {
+      "id": "semantic_zh_05",
+      "type": "semantic_zh",
+      "query": "怎么拦截模型输出的有害或违规内容",
+      "expected_sources": ["langchain/guardrails.md"],
+      "note": "guardrails（28 段）专讲输入输出护栏。「拦截/有害/违规」与 guardrail 无字面对应，纯语义。"
+    },
+    {
+      "id": "semantic_zh_06",
+      "type": "semantic_zh",
+      "query": "怎么把逐字生成的内容实时推给前端",
+      "expected_sources": ["langchain/streaming.md", "langgraph/streaming.md", "langchain/event-streaming.md"],
+      "note": "streaming 的中文说法；「逐字/实时/推给前端」无英文对应词。"
+    },
+    {
+      "id": "semantic_zh_07",
+      "type": "semantic_zh",
+      "query": "子图怎么跟父图共享状态",
+      "expected_sources": ["langgraph/use-subgraphs.md", "langgraph/checkpointers.md"],
+      "note": "use-subgraphs（61 段）讲父子图状态；checkpointers 有 checkpoint_ns 命名空间说明。「子图/父图」是 subgraph 的中文。"
+    },
+    {
+      "id": "semantic_zh_08",
+      "type": "semantic_zh",
+      "query": "怎么回到之前某一步重新执行",
+      "expected_sources": ["langgraph/use-time-travel.md", "langgraph/checkpointers.md"],
+      "note": "time-travel 的中文说法（17 段）；checkpointers 讲 checkpoint_id 回放。"
+    },
+
+    {
+      "id": "upload_zh_01",
+      "type": "upload_zh",
+      "query": "缓存雪崩怎么预防",
+      "expected_sources": ["缓存雪崩.md"],
+      "note": "你上传的中文笔记（27 段）。中文查询 + 中文文档 → BM25 有字面重叠，是 jieba 分词最该发挥价值的地方。"
+    },
+    {
+      "id": "upload_zh_02",
+      "type": "upload_zh",
+      "query": "布隆过滤器的误判率怎么降低",
+      "expected_sources": ["布隆过滤器.md"],
+      "note": "上传件（10 段，偏少）。同时检验小文档在 3705 段里能否被捞出来。"
+    },
+    {
+      "id": "upload_zh_03",
+      "type": "upload_zh",
+      "query": "秒杀系统的核心难点有哪些",
+      "expected_sources": ["秒杀问题概述.md"],
+      "note": "上传件（76 段，最大的一份中文笔记）。"
+    },
+    {
+      "id": "upload_zh_04",
+      "type": "upload_zh",
+      "query": "主从数据同步为什么会有延迟",
+      "expected_sources": ["主从数据同步原理.md"],
+      "note": "上传件（61 段）。查询与标题高度重叠，BM25 应该很容易命中——正好用来验证 jieba 是否生效。"
+    },
+    {
+      "id": "upload_zh_05",
+      "type": "upload_zh",
+      "query": "二叉搜索树删除节点分几种情况",
+      "expected_sources": ["BST.md"],
+      "note": "上传件（47 段），文件名是英文缩写 BST 但内容是中文。查询用中文全称「二叉搜索树」→ 文件名匹配不上，考内容检索。"
+    },
+    {
+      "id": "upload_zh_06",
+      "type": "upload_zh",
+      "query": "可重入锁和非可重入锁的区别",
+      "expected_sources": ["可重入锁.md"],
+      "note": "上传件只有 7 段（最小的之一），检验极小文档的召回。"
+    },
+    {
+      "id": "upload_zh_07",
+      "type": "upload_zh",
+      "query": "幂级数的收敛半径怎么求",
+      "expected_sources": ["12.4 幂级数.pdf"],
+      "note": "唯一的 PDF 上传件（9 段）。检验 pypdf 抽出的文本质量是否够检索。"
+    },
+    {
+      "id": "upload_zh_08",
+      "type": "upload_zh",
+      "query": "RAG 系统上线前怎么做评估",
+      "expected_sources": ["第3节. RAG评估.md", "langchain/test/evals.md"],
+      "ambiguous": true,
+      "note": "刻意保留的跨语料歧义题：你的课程笔记（33 段）和官方 evals 文档（24 段）都算对。用来观察四配置在「两个语料都相关」时的排序倾向。"
+    }
+  ]
+}
