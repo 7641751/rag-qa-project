@@ -17,15 +17,17 @@
 import io
 import json
 import re
-from datetime import datetime, timezone
+from datetime import timezone
+from functools import lru_cache
 from pathlib import Path
 
 from fastapi.responses import JSONResponse
 from langchain_core.documents import Document
 from langchain_text_splitters import Language, RecursiveCharacterTextSplitter
 
-from config import settings
+from agent.schemas import Base
 from backend.app.agent.graph import get_vectorstore
+from config import settings
 
 # DashScope 嵌入接口单次批量上限 20 条，超过报 400 InvalidParameter，留余量取 10。
 # 全项目只有这一个定义，别在调用方再写一份（会慢慢跑偏）。
@@ -218,3 +220,57 @@ def remove_upload_copies(doc_id: str) -> None:
     """删掉该 doc_id 的落盘原件（回滚与 DELETE 共用）。找不到就静默跳过。"""
     for path in settings.uploads_dir.glob(f"{doc_id}__*"):
         path.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------- mysql数据库相关
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from datetime import datetime
+
+
+def init_mysql():
+    """初始化 MySQL 数据库连接，返回数据库会话工厂。"""
+
+
+async def get_db_session():
+    """
+    获取数据库会话
+    """
+    AsyncSessionLocal = await get_db_session_maker()
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+        finally:
+            await session.close()
+
+
+@lru_cache(1)
+def get_db_engine():
+    """
+    获取数据库引擎
+    """
+    engine = create_async_engine(
+        settings.MYSQL_DATABASE_URL,
+        echo=True,  # 打印 SQL 语句（开发环境）
+        future=True  # 使用 SQLAlchemy 2.0 风格
+    )
+    return engine
+
+@lru_cache(1)
+def get_db_session_maker():
+    """
+    获取数据库会话工厂
+    """
+    engine = get_db_engine()
+    return async_sessionmaker(
+        engine,
+        class_=AsyncSession,
+        expire_on_commit=False  # 提交后不过期，允许访问属性
+    )
+
+# 初始化数据库表（创建所有表）
+async def init_db():
+    """创建所有表"""
+    engine = get_db_engine()
+    async with engine.begin() as conn:
+        await conn.run_sync(lambda sync_conn: Base.metadata.create_all(sync_conn))
+    print("✅ 数据库表创建完成")
