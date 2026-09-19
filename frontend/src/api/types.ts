@@ -9,7 +9,11 @@ export interface DoneEvent { thread_id: string; rewrites: number; grounded: bool
 export type ErrorCode =
   | 'VALIDATION_ERROR' | 'RETRIEVAL_ERROR' | 'LLM_ERROR' | 'INTERNAL_ERROR'
   | 'UNSUPPORTED_FILE_TYPE' | 'FILE_TOO_LARGE' | 'PARSE_ERROR'
-  | 'EMPTY_DOCUMENT' | 'EMBEDDING_ERROR' | 'NOT_FOUND';
+  | 'EMPTY_DOCUMENT' | 'EMBEDDING_ERROR' | 'NOT_FOUND'
+  // P2 鉴权新增 4 个：401 两种（UNAUTHORIZED 凭证缺失/失效、INVALID_CREDENTIALS 用户名或
+  // 密码错）+ 403 越权 + 409 注册重名。后端对登录失败的两种原因**故意不区分**，前端也一律
+  // 只显示 message、不据此分支。
+  | 'UNAUTHORIZED' | 'INVALID_CREDENTIALS' | 'FORBIDDEN' | 'USERNAME_TAKEN';
 export interface ErrorEvent { code: ErrorCode; message: string; }
 export interface ChatRequest { question: string; thread_id: string; }
 export type HistoryRole = 'user' | 'assistant';
@@ -71,4 +75,19 @@ export interface KbDeleteResponse {
   doc_id: string;
   filename: string;
   deleted_chunks: number;
+}
+
+// ---------- 鉴权（对齐 docs/api/openapi.yaml 的 Auth* schema） ----------
+export interface AuthUser { id: number; username: string; }
+
+export interface RegisterRequest { username: string; password: string; }
+
+/** 契约里 LoginRequest 与 RegisterRequest **同形**（后端复用同一个 pydantic 模型 Auth），
+ *  所以这里复用类型而不是重复定义一份，避免将来两边约束漂移。 */
+export type LoginRequest = RegisterRequest;
+
+export interface LoginResponse {
+  access_token: string;
+  token_type: string;      // 固定 'bearer'
+  user: AuthUser;
 }

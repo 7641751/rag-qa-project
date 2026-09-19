@@ -1,5 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { parseSSEFrame, splitFrames, streamChat, uploadDocument, fetchDocuments, deleteDocument, deleteThread } from '../api/client';
+import {
+  parseSSEFrame, splitFrames, streamChat, uploadDocument, fetchDocuments, deleteDocument,
+  deleteThread, fetchHistory, authHeaders, setUnauthorizedHandler,
+} from '../api/client';
+import { getToken, setToken } from '../api/tokenStore';
 import type { StepEvent, TokenEvent, DoneEvent, ErrorEvent, KbProgressEvent, KbDoneEvent } from '../api/types';
 
 function mockStream(chunks: string[], init: { ok?: boolean; status?: number; body?: string } = {}) {
@@ -21,7 +25,13 @@ function mockStream(chunks: string[], init: { ok?: boolean; status?: number; bod
   vi.stubGlobal('fetch', vi.fn().mockResolvedValue(res as unknown as Response));
 }
 
-beforeEach(() => vi.unstubAllGlobals());
+beforeEach(() => {
+  vi.unstubAllGlobals();
+  // 鉴权状态必须逐用例归零：token 存在会改变 request() 注入的 init 形状，
+  // 泄漏到后面的用例会让「无 token」相关断言变成假通过。
+  localStorage.clear();
+  setUnauthorizedHandler(null);
+});
 
 describe('parseSSEFrame', () => {
   it('解析单帧 event+data', () => {
@@ -141,6 +151,62 @@ describe('fetchDocuments / deleteDocument', () => {
   it('deleteDocument 非 2xx 抛错', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 404 } as unknown as Response));
     await expect(deleteDocument('nope')).rejects.toThrow(/404/);
+  });
+});
+
+// ============================ 鉴权：Authorization 注入与 401 集中处理 ============================
+describe('authHeaders / 401', () => {
+  it('有 token 返回 Bearer 头，无 token 返回空对象（不是 Bearer null）', () => {
+    expect(authHeaders()).toEqual({});
+
+    setToken('tk-1');
+
+    expect(authHeaders()).toEqual({ Authorization: 'Bearer tk-1' });
+  });
+
+  it('鉴权头只在实际有 token 时注入（无 token 时连 headers 键都不写）', async () => {
+    // 前半段就是既有 deleteThread 用例的基础：无 token 时 init 形状与改造前完全一致。
+    let fetchMock = vi.fn().mockResolvedValue({
+      ok: true, json: async () => ({ thread_id: 't1', messages: [] }),
+    } as unknown as Response);
+    vi.stubGlobal('fetch', fetchMock);
+
+    await fetchHistory('t1');
+    expect(fetchMock.mock.calls[0]![1]).toEqual({});
+
+    setToken('tk-2');
+    fetchMock = vi.fn().mockResolvedValue({
+      ok: true, json: async () => ({ thread_id: 't1', messages: [] }),
+    } as unknown as Response);
+    vi.stubGlobal('fetch', fetchMock);
+
+    await fetchHistory('t1');
+    expect((fetchMock.mock.calls[0]![1] as RequestInit).headers)
+      .toEqual({ Authorization: 'Bearer tk-2' });
+  });
+
+  it('带 token 却收到 401 → 清 token 并触发 onUnauthorized（会话失效）', async () => {
+    setToken('stale');
+    const onUnauthorized = vi.fn();
+    setUnauthorizedHandler(onUnauthorized);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 401 } as unknown as Response));
+
+    await expect(fetchHistory('t1')).rejects.toThrow(/401/);
+
+    expect(getToken()).toBeNull();
+    expect(onUnauthorized).toHaveBeenCalledTimes(1);
+  });
+
+  it('未带 token 的 401（登录密码错）→ 不清 token、不触发回调', async () => {
+    // 401 在本项目有**两种含义**：会话失效（带着 token 仍被拒）与凭证错（登录接口）。
+    // 不加这条分流，用户输错一次密码就会被当成「会话过期」，并多清一次 token。
+    const onUnauthorized = vi.fn();
+    setUnauthorizedHandler(onUnauthorized);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 401 } as unknown as Response));
+
+    await expect(fetchHistory('t1')).rejects.toThrow(/401/);
+
+    expect(onUnauthorized).not.toHaveBeenCalled();
   });
 });
 

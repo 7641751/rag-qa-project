@@ -32,13 +32,53 @@ const json = (res, code, obj) => {
 function cors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  // ⚠ 必须含 Authorization：P2 起 chat / kb 都带 Bearer 头，漏了它浏览器预检直接失败，
+  //   表现为「所有请求都报 CORS 错」，很容易误判成后端挂了。
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 }
 /** mock 不真解析 multipart，仅从 body 里粗提 filename */
 function pickFilename(buf) {
   const m = /filename="([^"]+)"/.exec(buf.toString('latin1'));
   return m ? m[1] : 'unknown.bin';
 }
+
+// ---------- 账号与令牌（内存态）----------
+// 预置一个演示账号，与后端 MySQL 里的测试账号一致：省得起 mock 后还要先注册一遍。
+const users = new Map([['hao', { id: 1, username: 'hao', password: 'abcd1234' }]]);
+let nextUserId = 2;
+
+/** mock 的 token 不是真 JWT（没有签名），结构为 `mock.<base64url(payload)>.sig`。
+ *  够用的理由：mock 只需要能判断「带没带、能不能解出未过期的 sub」，用来跑通前端的
+ *  401 → 自动登出这条链路；真正的签名校验由后端 pyjwt 负责，不在这里重复实现。 */
+const issueToken = user => `mock.${Buffer.from(JSON.stringify({
+  sub: String(user.id), username: user.username, exp: Date.now() + 7 * 864e5,
+})).toString('base64url')}.sig`;
+
+/** Authorization 头 → user；缺失 / 格式错 / 过期一律 null */
+function currentUser(req) {
+  const m = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? '');
+  if (!m) return null;
+  const parts = m[1].split('.');
+  if (parts.length !== 3 || parts[0] !== 'mock') return null;
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+    if (!payload.sub || !payload.exp || payload.exp < Date.now()) return null;
+    return { id: Number(payload.sub), username: String(payload.username ?? '') };
+  } catch { return null; }
+}
+
+/** 未登录 → 写 401 并返回 true（调用方直接 return） */
+function requireAuth(req, res) {
+  if (currentUser(req)) return false;
+  json(res, 401, { code: 'UNAUTHORIZED', message: '缺少或无效的 Authorization 头' });
+  return true;
+}
+
+const readJson = async req => {
+  const parts = [];
+  for await (const c of req) parts.push(c);
+  try { return JSON.parse(Buffer.concat(parts).toString('utf8')); } catch { return null; }
+};
 
 const server = http.createServer(async (req, res) => {
   cors(res);
@@ -49,6 +89,54 @@ const server = http.createServer(async (req, res) => {
     json(res, 200, { status: 'ok', kb_count: builtin.chunks, model: 'qwen3.7-text-embedding' });
     return;
   }
+
+  // ---------- 鉴权：三个公开端点 ----------
+  if (req.method === 'POST' && url.pathname === '/api/auth/register') {
+    const body = await readJson(req);
+    const username = String(body?.username ?? '');
+    const password = String(body?.password ?? '');
+    // 与真后端同一套约束（Auth 模型）：用户名 3-32 位字母/数字/下划线，密码 ≥ 8 位
+    if (!/^[A-Za-z0-9_]{3,32}$/.test(username) || password.length < 8) {
+      json(res, 422, {
+        code: 'VALIDATION_ERROR',
+        message: 'username: 需 3-32 位字母/数字/下划线；password: 至少 8 位',
+      });
+      return;
+    }
+    if (users.has(username)) {
+      json(res, 409, { code: 'USERNAME_TAKEN', message: '用户名已存在' });
+      return;
+    }
+    const user = { id: nextUserId++, username, password };
+    users.set(username, user);
+    json(res, 201, { id: user.id, username: user.username });
+    return;
+  }
+  if (req.method === 'POST' && url.pathname === '/api/auth/login') {
+    const body = await readJson(req);
+    const user = users.get(String(body?.username ?? ''));
+    // 故意不区分「用户不存在」与「密码错」，且文案逐字相同 —— 与真后端一致。
+    // 若这里能区分，联调时就会以为前端「在 mock 上能辨出用户名、在真后端却不行」。
+    if (!user || user.password !== String(body?.password ?? '')) {
+      json(res, 401, { code: 'INVALID_CREDENTIALS', message: '用户名或密码错误' });
+      return;
+    }
+    json(res, 200, {
+      access_token: issueToken(user), token_type: 'bearer',
+      user: { id: user.id, username: user.username },
+    });
+    return;
+  }
+  if (req.method === 'GET' && url.pathname === '/api/auth/me') {
+    const user = currentUser(req);
+    if (!user) { json(res, 401, { code: 'UNAUTHORIZED', message: 'token 无效或已过期' }); return; }
+    json(res, 200, { id: user.id, username: user.username });
+    return;
+  }
+
+  // ---- 以下端点自 P2 起全部要求登录（/api/health 是唯一公开的探活）----
+  if (requireAuth(req, res)) return;
+
   if (req.method === 'GET' && url.pathname === '/api/chat/history') {
     const tid = url.searchParams.get('thread_id') ?? '';
     // 未知/已删除的 thread → 200 + 空数组（契约：不报 404）
@@ -169,4 +257,6 @@ const server = http.createServer(async (req, res) => {
   json(res, 404, { code: 'NOT_FOUND', message: 'no route' });
 });
 
-server.listen(PORT, () => console.log(`[mock] SSE 服务已起: http://localhost:${PORT}（7 个端点）`));
+server.listen(PORT, () => console.log(
+  `[mock] SSE 服务已起: http://localhost:${PORT}（10 个端点）\n` +
+  '[mock] 演示账号 hao / abcd1234；自 P2 起 chat 与 kb 端点都要求 Bearer 头'));
