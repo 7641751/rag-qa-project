@@ -126,7 +126,61 @@ paths:
               schema: { $ref: '#/components/schemas/HistoryResponse' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+  /api/chat/threads:
+    get:
+      tags: [chat]
+      summary: 列出当前用户的会话(倒序，最多 50 条)
+      security:
+        - bearerAuth: []
+      description: >
+        需 Bearer token。只返回本人的会话，按 updated_at 倒序，最多 50 条。
+        total 是**真实总数**：total > threads.length 即表示被截断(最多回 50 条)，
+        前端据此显示「仅显示最近 50 条」——只回 50 条而不给 total 是看不出被截断的。
+        空列表返回 200 + threads:[](新用户进来就是这个状态，不是 404)。
+        created_at/updated_at 是带 Z 的 ISO 8601；前端必须按 UTC 解析 ——
+        new Date('2026-09-19T06:00:00')(无 Z)按 ECMAScript 规范会被当成**本地时间**，
+        相对时间整体偏掉一个时区。
+      responses:
+        '200':
+          description: 会话列表
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ThreadListResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
   /api/chat/threads/{thread_id}:
+    patch:
+      tags: [chat]
+      summary: 重命名会话
+      security:
+        - bearerAuth: []
+      description: >
+        需 Bearer token；非本人 → 403，不存在 → 404。
+        标题去两端空白后不能为空且不超过 60 字(DB 列宽 varchar(60))，否则 422；
+        存的是去空白后的值。
+        重命名**不改 updated_at**：它不是一次新活动，不该把会话顶到列表最前。
+        403 而非 404 是有意的：thread_id 由前端生成、就写在 URL 里，用户本来就知道
+        它存在，403 不构成额外信息泄露；这与「删别人的文档 → 404」相反，
+        那个 404 是为了不泄露文档的**存在性**。
+      parameters:
+        - name: thread_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RenameRequest' }
+      responses:
+        '200':
+          description: 重命名结果
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RenameResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/ThreadNotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
     delete:
       tags: [chat]
       summary: 删除会话的全部服务端状态(幂等)
@@ -326,6 +380,50 @@ components:
             adelete_thread 返回 None，拿不到是否真删了，后端需先探测存在性：
             checkpointer.alist(config, limit=1) 轻量判断即可（AsyncSqliteSaver 异步接口，
             其同步桥接方法在事件循环线程上调用会抛 InvalidStateError）。
+    ConversationSummary:
+      type: object
+      required: [thread_id, title, created_at, updated_at]
+      properties:
+        thread_id: { type: string, format: uuid }
+        title:
+          type: string
+          description: >
+            首问前 20 字，之后可由用户手动重命名(PATCH)。上限 60 字(DB 列宽 varchar(60))。
+        created_at:
+          type: string
+          format: date-time
+          description: 带 Z 的 ISO 8601(UTC)。前端必须按 UTC 解析，否则相对时间偏一个时区。
+        updated_at:
+          type: string
+          format: date-time
+          description: 最后一次提问时间(重命名不改它)。列表按它倒序。
+    ThreadListResponse:
+      type: object
+      required: [threads, total]
+      properties:
+        threads:
+          type: array
+          items: { $ref: '#/components/schemas/ConversationSummary' }
+        total:
+          type: integer
+          description: >
+            本人会话的**真实总数**。threads 最多 50 条，total 更大即表示被截断 ——
+            前端据此显示「仅显示最近 50 条」。只回 50 条而不给 total 是看不出截断的。
+    RenameRequest:
+      type: object
+      required: [title]
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 60
+          description: 新标题。去两端空白后不能为空，否则 422。
+    RenameResponse:
+      type: object
+      required: [thread_id, title]
+      properties:
+        thread_id: { type: string, format: uuid }
+        title: { type: string, description: 实际落库的标题(已去两端空白) }
     Health:
       type: object
       required: [status]
@@ -455,7 +553,18 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorBody' }
     DocNotFound:
-      description: doc_id 不存在(或指向不可删的预置文档)
+      description: >
+        doc_id 不存在、指向不可删的预置文档，或属于其他用户。
+        三种情况都是**过滤命中 0 条** → 同一个 404，刻意不用 403：
+        403 会泄露「该 doc_id 存在但不属于你」，而 404 与「这个 id 根本不存在」不可区分。
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorBody' }
+    ThreadNotFound:
+      description: >
+        thread_id 在 conversations 表里没有归属行（code=NOT_FOUND）。
+        注意与 Forbidden 的分工：有行但非本人 → 403；无行且调用方要求「必须已存在」
+        （如 PATCH 重命名）→ 404。而 GET /api/chat/history 对无行是**放行**返回空列表。
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorBody' }
@@ -465,7 +574,9 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorBody' }
     Forbidden:
-      description: 已登录，但目标 thread_id 不属于当前用户（code=FORBIDDEN）
+      description: >
+        已登录，但目标 thread_id 不属于当前用户（code=FORBIDDEN）。
+        适用于 chat 的 history / stream / threads 删除 / threads 重命名。
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorBody' }

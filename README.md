@@ -92,6 +92,8 @@ rag_qa_project/                      ← 唯一 Python 源根（见「开发约�
 ├── config.py                        # 配置中心（pydantic-settings，RAGQA_ 前缀覆盖）+ .env 加载
 ├── ingest.py                        # 预置知识库入库：加载 → 切分 → 嵌入 → Chroma
 ├── run.py                           # CLI 入口：普通 / 流式 / 调试 / 打印图结构
+├── scripts/
+│   └── migrate_kb_user_id.py        # P3 一次性迁移：给旧上传件补 user_id（--dry-run / --yes）
 ├── requirements.txt                 # 可读依赖清单（实际安装以仓库根 pyproject.toml + uv 为准）
 │
 ├── backend/
@@ -112,10 +114,12 @@ rag_qa_project/                      ← 唯一 Python 源根（见「开发约�
 ├── frontend/
 │   ├── src/api/                     # client.ts（SSE 解析）+ types.ts（对齐 openapi.yaml）
 │   ├── src/components/              # ChatWindow / MessageBubble / StepTrace / SourceChips /
-│   │                                # AnswerMarkdown / Composer / Header /
+│   │                                # AnswerMarkdown / Composer / Header / Sidebar /
+│   │                                # ConversationItem / LoginPage / ConfirmDialog /
 │   │                                # KnowledgeBaseDrawer / UploadZone / DocList
-│   ├── src/hooks/                   # useChat / useKnowledgeBase / useThreadId
-│   ├── src/test/                    # vitest（jsdom）7 个测试文件
+│   ├── src/hooks/                   # useChat / useThreadId / useKnowledgeBase /
+│   │                                # useConversations / useSidebar / useAuth
+│   ├── src/test/                    # vitest（jsdom）14 个测试文件
 │   └── mock/server.mjs              # 无后端时联调用：npm run mock 监听 :8000，实现全部 6 个端点
 │
 ├── data/
@@ -225,6 +229,12 @@ python run.py "RecursiveCharacterTextSplitter 怎么用？"     # 普通：一�
 python run.py "LangGraph 怎么做持久化？" --stream           # 流式：token 实时打印
 python run.py "如何构建 RAG agent？" --debug                # 调试：打印每个节点执行后的状态增量
 ```
+
+> ⚠ **CLI 的检索范围与网页端不同，这是刻意的**：`run.py` 无登录态，调
+> `build_graph()` 时 `user_id=None`，于是 `retrieve` 节点用的过滤条件是
+> `{"kb": "langchain_docs"}` —— **只检索 88 篇预置官方文档，不检索任何用户上传件**。
+> 无登录态时无从判断「该看谁的上传件」，放开就等于所有人能检索所有人的文档。
+> 要在 CLI 里验证上传件的检索效果，请改用网页端（带 token 后会注入真实 `user_id`）。
 
 ---
 
@@ -340,6 +350,29 @@ data: {"doc_id": "d68ae53c-...", "filename": "notes.md", "chunks": 1,
 
 ---
 
+## 多用户与数据隔离（P3）
+
+- **检索范围**：`{"$or":[{"kb":"langchain_docs"},{"user_id":<自己>}]}` —— 88 篇预置官方文档对
+  所有登录用户共享，**上传件仅本人可见**（检索、列表、删除、同名替换四处统一按 `user_id` 过滤）。
+- **删别人的文档 → `404`**（不是 403）：403 会泄露「该 `doc_id` 存在但不属于你」，
+  而 404 与「这个 id 根本不存在」不可区分，零额外代码且不泄露存在性。
+- **重命名别人的会话 → `403`**：这里刻意反过来 —— `thread_id` 由前端生成、就写在 URL 里，
+  用户本来就知道它存在，403 不构成额外泄露。两个选择出发点不同，详见 `docs/api/README.md`。
+- **旧上传件必须先迁移**：P3 之前的向量没有 `user_id`，在本规则下**对所有人都不可见**
+  （连原上传者也看不见）。上线顺序**不可颠倒**：
+
+```bash
+python scripts/migrate_kb_user_id.py --dry-run   # 核对数量（只读，不写入）
+python scripts/migrate_kb_user_id.py --yes       # 实际写入，归给第一个注册的用户
+python scripts/migrate_kb_user_id.py --dry-run   # 再跑应为 0 段待迁移（验证幂等）
+```
+
+> 先部署代码再迁移 → 从部署到迁移完成这段时间里所有上传件对所有人不可见；
+> 先迁移再部署 → 无副作用（多出来的 `user_id` 字段在旧代码下被忽略）。
+> 显式指定归属用 `--user <用户名>`。
+
+---
+
 ## 配置项
 
 全部集中在 [`config.py`](config.py)，可用 `RAGQA_` 前缀的环境变量覆盖：
@@ -379,8 +412,11 @@ npm run build                      # tsc --noEmit + vite build，产物 ~497 KB 
 
 两个测试文件都是**完全离线**的，靠依赖注入把外部服务换掉：
 
-- `test_graph.py`：`build_graph(model=..., retriever=...)` 接受任意模型与检索器，
-  用 `FakeRAGModel`（按 prompt 内容路由到 grade / rewrite / generate 三种行为）+ `FakeRetriever` 验证图结构与路由分支。
+- `test_graph.py`：`build_graph(model=..., vectorstore=...)` 接受任意模型与向量库，
+  用 `FakeRAGModel`（按 prompt 内容路由到 grade / rewrite / generate 三种行为）+ `FakeVectorStore` 验证图结构与路由分支。
+  后者会**记录每次调用收到的 `filter`**，所以「按用户隔离」的语义可以被直接断言。
+- `test_kb_isolation.py`：用 tmp_path 里的真 Chroma 验证归属隔离（谁的文档谁能看见/删/被同名替换命中）。
+  用真库而非手写 where 求值器，是因为隔离的成败取决于 Chroma 对 `$and`/`$or` 的真实语义。
 - `test_kb_upload.py`：`DeterministicFakeEmbedding` 替换 DashScope、`tmp_path` 里的独立 Chroma 替换真实库、
   `monkeypatch settings.uploads_dir` 隔离落盘目录，用 `TestClient` 跑完整 SSE 时序。
 

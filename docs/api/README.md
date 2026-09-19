@@ -17,6 +17,8 @@ CRAG（纠错式检索增强）问答后端的接口契约。前端（`frontend/
 | `GET` | `/api/auth/me` | 当前登录用户 | ✅ | `application/json` |
 | `POST` | `/api/chat/stream` | 提问并流式作答 | ✅ | `text/event-stream` |
 | `GET` | `/api/chat/history` | 拉取会话历史（`?thread_id=`） | ✅ | `application/json` |
+| `GET` | `/api/chat/threads` | 列出当前用户的会话（倒序，最多 50 条） | ✅ | `application/json` |
+| `PATCH` | `/api/chat/threads/{thread_id}` | 重命名会话 | ✅ | `application/json` |
 | `DELETE` | `/api/chat/threads/{thread_id}` | 删除会话的全部服务端状态（幂等） | ✅ | `application/json` |
 | `POST` | `/api/kb/documents` | 上传文档并入库（SSE 进度） | ✅ | `text/event-stream` |
 | `GET` | `/api/kb/documents` | 列出用户上传的文档 | ✅ | `application/json` |
@@ -47,7 +49,11 @@ Authorization: Bearer <access_token>
   - 库里有、但不是本人 → `403 FORBIDDEN`。
   - 首次提问会把 `thread_id → user_id` 落库，`title` 取首问前 20 字；后续提问只刷新 `updated_at`，标题与归属都不再变。
 - **`403` 在流开始前**：`/api/chat/stream` 的归属校验发生在返回 `StreamingResponse` **之前**，所以拿到的是 HTTP `403` 而不是 SSE `error` 帧 —— 前端不必为同一端点写两套错误处理。同理，校验先于读 checkpointer，`403` 不因 checkpointer 不可读而变成 `500`。
-- **知识库本期不做归属隔离（已知缺口）**：上传件的 metadata 里不写 `user_id`，服务端无从判断某个 `doc_id` 属于谁，因此**任何登录用户都能删除任何上传件**。本期只要求登录，归属隔离留待 P3（届时 metadata 加 `user_id` + 检索过滤）。`frontend/` 不要基于「KB 已隔离」做假设。
+- **知识库按归属隔离（P3 起）**：上传件的每段 metadata 都带 `user_id`，列表与删除都按它过滤。
+  - 列表只返回本人上传件；`builtin` 摘要是**全局**统计（预置的 88 篇官方文档对所有用户共享），刻意不加用户过滤。
+  - 删别人的文档 → 过滤命中 0 条 → `404 NOT_FOUND`，**不是 `403`** —— 403 会泄露「该 `doc_id` 存在但不属于你」，而 404 与「这个 id 根本不存在」不可区分。
+  - **检索范围**：`{"$or":[{"kb":"langchain_docs"},{"user_id":<自己>}]}` —— 预置文档全局可见，上传件仅本人可见。CLI（`run.py`）没有登录态 → `user_id=None` → **只检索预置文档**，这是刻意行为而非缺陷。
+  - **同名替换只在本人范围内检测**：A 传 `笔记.md` 不会影响 B 的同名文档。（P3 之前只按 `filename + origin` 找旧件，A 的同名上传会把 B 的向量**与落盘原件**一起删掉，属数据丢失级缺陷。）
 
 ---
 
@@ -268,6 +274,46 @@ curl -s "http://localhost:8000/api/chat/history?thread_id=550e8400-e29b-41d4-a71
 
 ---
 
+## 会话列表端点（P3）
+
+侧栏用它列出当前用户的会话，支持切换、重命名、删除。
+
+### GET /api/chat/threads
+
+```json
+{ "threads": [{ "thread_id": "2f1c9a04-6b7e-4d21-9c33-1ab2cd34ef56",
+                "title": "checkpointer 怎么删会话",
+                "created_at": "2026-09-13T06:12:44Z",
+                "updated_at": "2026-09-13T06:20:10Z" }],
+  "total": 1 }
+```
+
+- 只返回**本人**的会话，按 `updated_at` **倒序**，**最多 50 条**。
+- `total` 是**真实总数**：`total > threads.length` 即表示被截断，前端据此显示「仅显示最近 50 条」。只回 50 条而不给 `total`，前端无从判断是被截断还是真的只有这么多。
+- **空列表 → `200` + `"threads": []`**，不报 404（新用户进来就是这个状态，不能当异常）。
+- ⚠ `created_at` / `updated_at` 是**带 `Z` 的** ISO 8601。前端必须按 UTC 解析：`new Date('2026-09-19T06:00:00')`（无 `Z`）按 ECMAScript 规范会被当成**本地时间**，相对时间整体偏掉一个时区（UTC+8 下「刚刚」显示成「8 小时前」）。
+
+### PATCH /api/chat/threads/{thread_id}
+
+请求 `{ "title": "新标题" }`，成功 `200 { "thread_id": "...", "title": "新标题" }`。
+
+| 情况 | 响应 |
+|---|---|
+| 标题去空白后为空，或超 60 字（DB 列宽 `varchar(60)`） | `422 VALIDATION_ERROR` |
+| 会话不属于当前用户 | `403 FORBIDDEN` |
+| 会话不存在 | `404 NOT_FOUND` |
+
+- 标题两端的空白会被去掉后再存（`"  x  "` → `"x"`）。
+- **重命名不改 `updated_at`**：它不是一次新活动，不该把会话顶到列表最前。
+
+> ⚠ 这里用 `403` 而不是 `404` 是有意的：会话 id 由前端生成、就写在 URL 里，用户本来就知道它存在，403 不构成额外信息泄露。这与「删别人的**文档** → `404`」相反 —— 那个 404 是为了不泄露文档的**存在性**。
+
+### 与删除的关系
+
+`DELETE /api/chat/threads/{thread_id}` 的语义**完全不变**（P1 的幂等 + P2 的归属校验都保留）。唯一联动：删完要重新 `GET /api/chat/threads` 才能拿准 `total` —— 前端本地乐观移除改不了 `total`。
+
+---
+
 ## 知识库端点
 
 用户在网页上传自己的文档进知识库。上传写进**与预置文档同一个 Chroma collection**（`langchain_docs`），靠 metadata `origin="upload"` 区分，因此**服务无需重启、图无需重建**，上传完立即可被问答检索到。
@@ -309,7 +355,7 @@ curl -s "http://localhost:8000/api/chat/history?thread_id=550e8400-e29b-41d4-a71
 - 失败：发 `error` 后关闭流，**不再有 `done`**。
 - 前端把 `done` 视为流结束信号；若流在无 `done` 也无 `error` 的情况下关闭（异常断连），前端按“网络中断”处理。
 
-**同名文件视为替换**：后端按 `{"$and":[{"filename":X},{"origin":"upload"}]}` 检测，命中则先删旧向量与旧落盘原件，再按新 `doc_id` 入库，`done.replaced = true`。
+**同名文件视为替换（仅限本人）**：后端按 `{"$and":[{"filename":X},{"origin":"upload"},{"user_id":<自己>}]}` 检测，命中则先删旧向量与旧落盘原件，再按新 `doc_id` 入库，`done.replaced = true`。`user_id` 这个条件不可省 —— 缺了它，A 上传同名文件会把 B 的文档连向量带原件一起删掉。
 
 **中途取消必须回滚**：前端提供取消按钮，用户取消 → fetch abort → 后端异步生成器收到 `asyncio.CancelledError`。此时该文档已写入的向量是“半截”的，会污染检索。**后端必须在 `except asyncio.CancelledError` / `finally` 中按 `doc_id` 回滚已写入向量**，保证“要么整个文档入库成功，要么库里干干净净”。
 
@@ -335,7 +381,7 @@ curl -N -X POST http://localhost:8000/api/kb/documents -F "file=@/path/to/notes.
   "builtin": { "docs": 88, "chunks": 2885 }
 }
 ```
-- `documents`：**只含 `origin="upload"`**，按 `uploaded_at` **倒序**。
+- `documents`：**只含本人的 `origin="upload"`**（P3 起按 `user_id` 过滤），按 `uploaded_at` **倒序**。
 - 必填字段：`doc_id`、`filename`、`chunks`、`uploaded_at`；可选：`title`（md 取首个 `# 标题`，pdf/txt 可回退为 filename）、`size_bytes`。
 - `builtin`：**整个对象可选**——统计不到就省略，前端自动隐藏那行摘要，不报错。
 - **空库 → `200` + `"documents": []`**，不报 404（与 `/api/chat/history` 对未知 `thread_id` 返回空列表的语义一致）。
@@ -352,7 +398,7 @@ curl -N -X POST http://localhost:8000/api/kb/documents -F "file=@/path/to/notes.
 ```json
 { "doc_id": "0f0a1b2c-3d4e-4f50-8a6b-7c8d9e0f1a2b", "filename": "report.pdf", "deleted_chunks": 100 }
 ```
-- **删除过滤条件必须为** `{"$and":[{"doc_id":X},{"origin":"upload"}]}`。这一条同时实现了“预置文档不可删”：若 `doc_id` 命中 88 篇官方文档（它们没有 `origin` 字段），过滤结果为空 → 直接 `404`，**无需额外的 403 分支**。
+- **删除过滤条件必须为** `{"$and":[{"doc_id":X},{"origin":"upload"},{"user_id":<自己>}]}`。这一条 where 同时实现三件事：① “预置文档不可删” —— 若 `doc_id` 命中 88 篇官方文档（它们没有 `origin` 字段），过滤结果为空；② “别人的文档删不掉” —— `user_id` 不匹配同样命中 0 条；③ 两者都直接落到 `404`，**无需额外的 403 分支**，也不泄露存在性。
 - `doc_id` 不存在 → `404` + `{"code":"NOT_FOUND","message":"文档不存在: <doc_id>"}`。
 - **幂等**：重复删同一 `doc_id`，第二次返回 `404`（已不存在），不是 `500`。
 - 同时删除 `data/uploads/` 里的落盘原件（后端内部行为，契约不约束）。
@@ -366,12 +412,20 @@ curl -N -X POST http://localhost:8000/api/kb/documents -F "file=@/path/to/notes.
 | `doc_id` | ✅ | `uuid4()` 字符串 | 删除 / 替换的定位键 |
 | `filename` | ✅ | 原始文件名 | 列表展示、同名检测 |
 | `origin` | ✅ | 固定 `"upload"` | 与预置文档区分；列表/删除过滤 |
+| `user_id` | ✅ | 整数（上传者） | **归属隔离**：列表/删除/同名替换/检索都按它过滤（P3 新增） |
 | `uploaded_at` | ✅ | ISO 8601 UTC | 列表排序与展示 |
 | `title` | 可选 | md 首个 `# 标题`，否则同 `filename` | 列表展示、来源芯片 |
 | `source` | 建议 | `uploads/<doc_id>__<filename>` | 与现有 `source` 语义一致 |
 | `size_bytes` | 可选 | 整数 | 列表展示 |
 
-预置的 88 篇文档**保持现状不带 `origin` 字段**（无需重建），因此 `where={"origin":"upload"}` 天然只匹配上传项。
+预置的 88 篇文档**保持现状不带 `origin`、也不带 `user_id`**（无需重建），靠 `kb="langchain_docs"` 标记。它们对所有用户可见，因此：
+
+- 列表/删除的过滤条件带 `origin` → 天然只匹配上传项；
+- 检索的过滤条件用 `{"$or":[{"kb":"langchain_docs"},{"user_id":uid}]}` → 预置文档全局共享。
+
+> ⚠ **写过滤条件时不要用 `origin` 去找预置文档**：它们根本没有这个字段。写成 `{"$or":[{"origin":"builtin"},...]}` 会让 88 篇官方文档全部从检索结果里消失，**而且不报任何错** —— 问答质量断崖下跌但无人察觉。正确的标记字段是 `kb`。
+
+> ⚠ **P3 之前的旧上传件没有 `user_id`**，在本契约下对所有人不可见。上线时必须先跑 `scripts/migrate_kb_user_id.py` 补迁移（`--dry-run` → `--yes` → 再 `--dry-run` 验证幂等）。
 
 ### 限额汇总
 
