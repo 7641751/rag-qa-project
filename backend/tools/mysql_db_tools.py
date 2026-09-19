@@ -175,9 +175,11 @@ async def aclose_db() -> None:
     不释放会让 uvicorn Ctrl+C 后进程卡住；而且连接绑定在创建它的那个事件循环上，
     跨事件循环复用会报隐晦的错 —— 清缓存正是为此。
 
-    ⚠ **当前尚未接线**：本模块现在没有任何运行时调用方，`api/main.py` 的 lifespan
-    与 `run.py` 都还没调它。P2 把 DB 端点挂上路由时必须补上收尾（与
-    `aclose_checkpointer()` 并列），否则连接会随进程退出悬空。
+    调用方（两处，都必须显式调）：
+    - `api/main.py` 的 lifespan shutdown，与 `aclose_checkpointer()` 并列；
+    - `scripts/migrate_kb_user_id.py` —— 它用 `asyncio.run()` 建连接，循环一结束
+      连接就成了跨循环的悬空句柄，随后在 `__del__` 里 close 会抛
+      `RuntimeError: Event loop is closed`。
 
     从未构造过单例时静默返回；重复调用安全。
     """
