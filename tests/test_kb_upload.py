@@ -102,6 +102,11 @@ def _upload(client, filename: str, raw: bytes):
                        files={"file": (filename, raw, "application/octet-stream")})
 
 
+def _token(uid: int, name: str) -> dict:
+    """换一个用户身份的请求头（client fixture 默认是 id=1 的 alice）。"""
+    return {"Authorization": f"Bearer {sec.create_access_token(uid, name)}"}
+
+
 # ============================ 1. 原语单元 ============================
 def test_embed_batch_writes_contract_metadata(fake_vs):
     """embed_batch 必须把纯文本包成 Document 并带齐契约要求的 metadata。
@@ -286,6 +291,52 @@ def test_same_filename_replaces_old_doc(client, fake_vs):
     assert [d["doc_id"] for d in docs] == [second["doc_id"]]   # 旧 doc 彻底消失
     assert fake_vs._collection.count() == second["chunks"]
     assert not list(settings.uploads_dir.glob(f"{first['doc_id']}__*"))
+
+
+def test_upload_writes_user_id_metadata(client, fake_vs):
+    """★ P3 §12.1 #8：上传必须把 user_id 写进**每一段** metadata。
+
+    漏了的后果是「用户自己上传的文档自己也检索不到」—— `kb_filter` 生成的过滤条件
+    匹配不上没有 user_id 的向量，而抽屉里却列得出这份文档：用户看得见、问不到，
+    且不报任何错。只写第一段同样不行，那会留下"孤儿向量"。
+    """
+    r = _upload(client, "带归属.md", _big_markdown(5))
+    assert r.status_code == 200
+
+    metadatas = fake_vs._collection.get(include=["metadatas"])["metadatas"] or []
+    assert metadatas, "上传后库里应当有向量"
+    missing = [md for md in metadatas if md.get("user_id") != 1]   # fixture 的 token 是 id=1
+    assert not missing, f"有 {len(missing)} 段向量缺 user_id（应为 1）"
+
+
+def test_same_filename_other_user_does_not_touch_others_doc(client, fake_vs):
+    """★ P3 §12.1 #9（端点级）：A 再传一次同名文件，不得动到 B 的同名文档。
+
+    这是 spec §1 问题 2 的完整复现路径。修复前 `find_upload_doc_ids` 只按
+    filename + origin 找旧件，于是 A 的上传会把 B 的向量**与落盘原件**一起删掉
+    —— 静默的数据丢失，用户只会发现资料凭空消失。
+    """
+    # B 先传一份 笔记.md
+    b = client.post("/api/kb/documents", headers=_token(2, "bob"),
+                    files={"file": ("笔记.md", _big_markdown(5), "application/octet-stream")})
+    doc_b = _parse_sse(b.text)[-1][1]["doc_id"]
+
+    # A 传同名文件两次（第二次才会命中"替换自己那份"的路径）
+    _upload(client, "笔记.md", _big_markdown(5))
+    doc_a = _parse_sse(_upload(client, "笔记.md", _big_markdown(5)).text)[-1][1]["doc_id"]
+    assert doc_a != doc_b
+
+    # B 的向量与落盘原件必须原封不动
+    b_ids = fake_vs._collection.get(
+        where={"$and": [{"doc_id": doc_b}, {"origin": "upload"}]}, include=[])["ids"]
+    assert b_ids, "B 的向量被 A 的同名上传删光了（数据丢失级回归）"
+    assert list(settings.uploads_dir.glob(f"{doc_b}__*")), "B 的落盘原件被删了"
+
+    # 各自的列表互不串味
+    assert [d["doc_id"] for d in
+            client.get("/api/kb/documents").json()["documents"]] == [doc_a]
+    assert [d["doc_id"] for d in
+            client.get("/api/kb/documents", headers=_token(2, "bob")).json()["documents"]] == [doc_b]
 
 
 def test_list_documents_sorted_desc_with_builtin_summary(client, fake_vs):
