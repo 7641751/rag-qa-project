@@ -27,21 +27,24 @@ ALLOWED_EXT = (".md", ".txt", ".pdf")
 MAX_BYTES = 20 * 1024 * 1024
 
 
-def _rollback(doc_id: str) -> int:
+def _rollback(doc_id: str, user_id: int) -> int:
     """回滚：删掉已写入的向量 + 落盘原件，返回清除的向量条数。
 
     这里**故意不走 asyncio.to_thread**：CancelledError / GeneratorExit 分支里再 await，
     很可能被二次取消打断，回滚就做不完了。Chroma 按 metadata 删除是毫秒级 SQLite 操作，
     用"短暂阻塞事件循环"换"回滚一定执行完"是划算的。
+
+    user_id 必须带上：删除按归属过滤，漏了它回滚会**删不掉**自己刚写的向量，
+    半截数据留在库里污染检索。
     """
-    gone = delete_upload_doc(doc_id)
+    gone = delete_upload_doc(doc_id, user_id)
     remove_upload_copies(doc_id)
     print(f"[kb] ↳ 回滚 doc_id={doc_id[:8]}…（清除 {gone} 段向量）")
     return gone
 
 
 async def stream_upload(filename: str, raw: bytes, doc_id: str,
-                        uploaded_at: str, replaced: bool):
+                        uploaded_at: str, replaced: bool, user_id: int):
     """异步生成器：每 yield 一个字符串就是一帧 SSE。
 
     成功时序：progress(saved) -> progress(parsed) -> progress(split)
@@ -58,12 +61,12 @@ async def stream_upload(filename: str, raw: bytes, doc_id: str,
             chunks = await asyncio.to_thread(parse_and_split, raw, filename)
         except ValueError:
             yield sse("error", {"code": "EMPTY_DOCUMENT", "message": "解析后无有效文本"})
-            _rollback(doc_id)
+            _rollback(doc_id, user_id)
             return
         except Exception as exc:  # PDF 加密/损坏、编码无法识别
             yield sse("error", {"code": "PARSE_ERROR",
                                 "message": f"解析失败：{type(exc).__name__}: {exc}"})
-            _rollback(doc_id)
+            _rollback(doc_id, user_id)
             return
 
         yield sse("progress", {"stage": "parsed",
@@ -74,12 +77,15 @@ async def stream_upload(filename: str, raw: bytes, doc_id: str,
         yield sse("progress", {"stage": "split", "current": total, "total": total,
                                "message": f"切分为 {total} 段"})
 
-        # metadata 必须在写入时就带齐：doc_id/filename/origin/uploaded_at 是契约必填，
-        # 列表、删除、同名替换、取消回滚全靠它们定位。
+        # metadata 必须在写入时就带齐：doc_id/filename/origin/user_id/uploaded_at 是必填，
+        # 列表、删除、同名替换、取消回滚、检索隔离全靠它们定位。
+        # user_id 是 P3 加的：漏了它，这份文档**连上传者自己都检索不到**（kb_filter 匹配不上），
+        # 而且不报任何错 —— 只是用户在抽屉里看得见、提问却永远命中不了。
         meta = {
             "doc_id": doc_id,
             "filename": filename,
             "origin": "upload",
+            "user_id": user_id,
             "uploaded_at": uploaded_at,
             "title": doc_title(filename, chunks),
             "source": f"uploads/{doc_id}__{filename}",
@@ -94,7 +100,7 @@ async def stream_upload(filename: str, raw: bytes, doc_id: str,
                 yield sse("error", {"code": "EMBEDDING_ERROR",
                                     "message": f"嵌入失败（第 {i + 1} 段起）："
                                                f"{type(exc).__name__}: {exc}"})
-                _rollback(doc_id)
+                _rollback(doc_id, user_id)
                 return
             written += n
             yield sse("progress", {"stage": "embedding", "current": written, "total": total,
@@ -107,23 +113,28 @@ async def stream_upload(filename: str, raw: bytes, doc_id: str,
     # 客户端 abort 时，异步生成器收到的是 CancelledError（实测，不是 GeneratorExit）
     except asyncio.CancelledError:
         print("[kb] ✘ 收到 asyncio.CancelledError")
-        _rollback(doc_id)
+        _rollback(doc_id, user_id)
         raise  # 关键：不要吞掉取消信号
     except GeneratorExit:
         print("[kb] ✘ 收到 GeneratorExit")
-        _rollback(doc_id)
+        _rollback(doc_id, user_id)
         # ⚠ 这里**绝不能再 yield**，否则 RuntimeError: async generator ignored GeneratorExit
         raise
     except Exception as exc:  # 流已开始，只能用 SSE error 通知
         print(f"[kb] ✘ 收到普通异常 {type(exc).__name__}: {exc}")
         yield sse("error", {"code": "INTERNAL_ERROR", "message": f"{type(exc).__name__}: {exc}"})
-        _rollback(doc_id)
+        _rollback(doc_id, user_id)
     finally:
         print(f"[kb]   finally 执行（written={written}）")
 
 
-async def sse_upload(file: UploadFile = File(...)):
-    """POST /api/kb/documents 的实际处理：校验 -> 落盘 -> 返回 SSE 流。"""
+async def sse_upload(file: UploadFile = File(...), user_id: int = 0):
+    """POST /api/kb/documents 的实际处理：校验 -> 落盘 -> 返回 SSE 流。
+
+    ⚠ `user_id` 有默认值 0 **只为兼容既有测试的调用方式**；它必须由路由显式传入
+    `current_user.id`。若去掉默认值，FastAPI 会把它当成 query 参数（而不是从 token 取），
+    于是任何人都能伪造 user_id 往别人名下写文档。
+    """
     filename = file.filename or "unknown.bin"
     if not filename.lower().endswith(ALLOWED_EXT):
         return err(415, "UNSUPPORTED_FILE_TYPE", f"仅支持 {' / '.join(ALLOWED_EXT)}")
@@ -134,10 +145,11 @@ async def sse_upload(file: UploadFile = File(...)):
     if not raw:
         return err(422, "VALIDATION_ERROR", "文件为空")
 
-    # 同名视为替换（契约 §4.2）：先删旧向量与旧落盘原件，再按新 doc_id 入库
-    old_ids = await asyncio.to_thread(find_upload_doc_ids, filename)
+    # 同名视为替换（契约 §4.2）：先删**本人的**旧向量与旧落盘原件，再按新 doc_id 入库。
+    # 传 user_id 是必须的 —— 否则 A 传一个与 B 同名的文件会把 B 的文档删掉（数据丢失级）。
+    old_ids = await asyncio.to_thread(find_upload_doc_ids, filename, user_id)
     for old_id in old_ids:
-        await asyncio.to_thread(delete_upload_doc, old_id)
+        await asyncio.to_thread(delete_upload_doc, old_id, user_id)
         await asyncio.to_thread(remove_upload_copies, old_id)
     replaced = bool(old_ids)
 
@@ -148,7 +160,7 @@ async def sse_upload(file: UploadFile = File(...)):
     await asyncio.to_thread(save_upload_copy, doc_id, filename, raw)
 
     return StreamingResponse(
-        stream_upload(filename, raw, doc_id, uploaded_at, replaced),
+        stream_upload(filename, raw, doc_id, uploaded_at, replaced, user_id),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
                  "X-Accel-Buffering": "no"},  # 关代理缓冲，否则帧被憋住

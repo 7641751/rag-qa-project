@@ -9,12 +9,20 @@
 1. **不在 import 期碰向量库**。get_vectorstore() 会加载 Chroma + DashScope 嵌入，
    写成模块级变量等于把重活提到进程启动，知识库没入库时整个 app 都起不来；
    它本身是 @lru_cache 单例，函数里现取的开销只是一次字典查找。
-2. **每个向量块写入时就必须带齐 doc_id / filename / origin / uploaded_at**。
-   列表、删除、同名替换、取消回滚全靠 metadata 过滤定位，缺一个就变成"孤儿向量"，
-   而 Chroma 事后补 metadata 等于整块重新嵌入。
-3. **凡是删/查用户上传的过滤条件都带 origin="upload"**。预置的官方文档没有该字段，
-   天然删不掉也列不出，不需要额外的 403 分支。
-   另注：Chroma 的 $and 至少要两个条件，单条件必须直接写 {"origin": "upload"}，
+2. **每个向量块写入时就必须带齐 doc_id / filename / origin / user_id / uploaded_at**。
+   列表、删除、同名替换、取消回滚、检索隔离全靠 metadata 过滤定位，缺一个就变成
+   "孤儿向量"。
+   ⚠「事后补 metadata 等于整块重新嵌入」这句话**只对 LangChain 的 add_documents
+   路径成立**（它总会调嵌入接口）。走 raw collection 的 `_collection().update(
+   ids=..., metadatas=...)` 时，只要不传 documents，Chroma 就跳过嵌入
+   （chromadb CollectionCommon.update：update_embeddings 为 None），零额度消耗 ——
+   scripts/migrate_kb_user_id.py 的 P3 迁移正是靠这一点。
+3. **凡是删/查用户上传的过滤条件都带 origin="upload" 与 user_id**（P3 §6）：
+   - `origin` 让预置文档天然删不掉也列不出（官方文档没有该字段），不必额外写 403 分支；
+   - `user_id` 实现按归属隔离，命中 0 条 → 上层返回 404，**不泄露存在性**；
+   - ⚠ 漏掉 user_id 的后果是**数据丢失级**的：A 再传一次同名文件会把 B 的同名文档
+     连向量带落盘原件一起删掉（tests/test_kb_isolation.py 钉住了这一点）。
+   另注：Chroma 的 $and / $or 至少要两个条件，单条件必须直接写 {"origin": "upload"}，
    包一层 $and 会抛 ValueError。
 """
 import io
@@ -113,23 +121,31 @@ def embed_batch(chunks: list[str], meta: dict, start: int = 0) -> int:
     return len(docs)
 
 
-def find_upload_doc_ids(filename: str) -> list[str]:
-    """同名替换（契约 §4.2）：按 filename + origin=upload 找出已存在的旧 doc_id。"""
+def find_upload_doc_ids(filename: str, user_id: int) -> list[str]:
+    """同名替换（契约 §4.2）：按 filename + origin=upload + user_id 找**本人的**旧 doc_id。
+
+    ⚠ user_id 是 P3 加的关键条件，不是锦上添花：缺了它，A 传一个与 B 同名的文件就会
+    把 B 的文档删掉（且原件一并清掉）——静默数据丢失。三个条件也顺便满足 $and ≥2 的要求。
+    """
     got = _collection().get(
-        where={"$and": [{"filename": filename}, {"origin": "upload"}]},
+        where={"$and": [{"filename": filename}, {"origin": "upload"},
+                        {"user_id": user_id}]},
         include=["metadatas"])
     # 同一 doc_id 有 N 段向量，去重后才是文档数
     return sorted({md["doc_id"] for md in (got["metadatas"] or []) if md.get("doc_id")})
 
 
-def get_upload_doc(doc_id: str) -> dict | None:
-    """按 doc_id 取单个上传文档的元信息（含 chunks 计数），不存在返回 None。
+def get_upload_doc(doc_id: str, user_id: int) -> dict | None:
+    """按 doc_id 取单个上传文档的元信息（含 chunks 计数）；不存在**或非本人**返回 None。
+
+    返回 None 而非抛 403 是刻意的：上层据此给出 404，不泄露「该 doc_id 存在但不属于你」。
 
     include=[] 是刻意的：这里只要 ids 计数和一份 metadata，
     省掉 include 的话 Chroma 会把每段 page_content 全拉出来。
     """
     got = _collection().get(
-        where={"$and": [{"doc_id": doc_id}, {"origin": "upload"}]},
+        where={"$and": [{"doc_id": doc_id}, {"origin": "upload"},
+                        {"user_id": user_id}]},
         include=["metadatas"])
     metadatas = got["metadatas"] or []
     if not metadatas:
@@ -143,13 +159,18 @@ def get_upload_doc(doc_id: str) -> dict | None:
             "chunks": len(metadatas)}
 
 
-def list_upload_docs() -> list[dict]:
-    """列出所有 origin=upload 的文档，按 uploaded_at 倒序。空库返回 []，不报 404。
+def list_upload_docs(user_id: int) -> list[dict]:
+    """列出**本人** origin=upload 的文档，按 uploaded_at 倒序。空库返回 []，不报 404。
+
+    ⚠ where 从单条件 {"origin": "upload"} 变成两条件 $and，是加了 user_id 的必然结果
+    （$and 要求 ≥2 个子条件）。别为了「少一层嵌套」把它改回单条件 —— 那会列出所有人的文档。
 
     ⚠ include 必须显式给 ["metadatas"]：省略时 Chroma 默认连 documents 一起返回，
     上传几百段就是数 MB 无用数据。ids 是**分块** id，文档 id 要从 metadata 里取。
     """
-    got = _collection().get(where={"origin": "upload"}, include=["metadatas"])
+    got = _collection().get(
+        where={"$and": [{"origin": "upload"}, {"user_id": user_id}]},
+        include=["metadatas"])
     grouped: dict[str, dict] = {}
     for md in got["metadatas"] or []:
         doc_id = md.get("doc_id")
@@ -178,14 +199,16 @@ def builtin_stats() -> dict | None:
     return {"docs": len({md.get("source") for md in metadatas}), "chunks": len(metadatas)}
 
 
-def delete_upload_doc(doc_id: str) -> int:
-    """按 doc_id 删除该上传文档的全部向量块，返回删除条数（0 = 文档不存在）。
+def delete_upload_doc(doc_id: str, user_id: int) -> int:
+    """按 doc_id 删除**本人**该上传文档的全部向量块，返回删除条数（0 = 不存在或非本人）。
 
-    $and 里同时含 origin=upload，一条过滤就实现了"预置文档不可删"：
-    官方文档没有 origin 字段，命中 0 条 → 上层直接 404，无需额外 403 分支。
+    一条 where 同时实现两件事：
+    - 含 origin=upload → 预置文档不可删（官方文档没有该字段）；
+    - 含 user_id → 别人的文档不可删，命中 0 条 → 上层 404，无需额外 403 分支。
     先 get 再 delete 是为了拿到 deleted_chunks（Chroma 的 delete 不返回条数）。
     """
-    where = {"$and": [{"doc_id": doc_id}, {"origin": "upload"}]}
+    where = {"$and": [{"doc_id": doc_id}, {"origin": "upload"},
+                      {"user_id": user_id}]}
     col = _collection()
     gone = len(col.get(where=where, include=[]).get("ids") or [])
     if gone:  # delete 未命中时是静默 no-op，这里省一次无谓写入

@@ -1,11 +1,12 @@
 # rag_qa_project/tests/test_kb_requires_login.py
 # -*- coding: utf-8 -*-
-"""KB 三端点的鉴权门：要求登录，但**本期不做归属隔离**（spec §3 决策 4）。
+"""KB 三端点的鉴权门（401）与归属隔离（404）。
 
-本文件同时是一份「已知越权的存证」。`test_kb_endpoints_require_login_but_not_ownership`
-断言"用户 B 能删掉用户 A 上传的文档且返回 200" —— 这不是期望行为，是本阶段有意留下的
-缺口。把它写成断言而不是 TODO 注释，是为了让这个行为**一旦变化就立刻红灯**：P3 补上归属
-隔离后测试会指向这里，提醒作者同步改契约与前端，而不是让越权被悄悄修好或悄悄引入。
+**P3 已翻转本文件的第二条断言**：原先 `test_kb_endpoints_require_login_but_not_ownership`
+断言「用户 B 能删掉用户 A 上传的文档且返回 200」，那是 P2 有意留下的已知缺口，
+写成断言是为了让它一旦变化就立刻红灯。P3 补上归属隔离后它如期变红，现改名为
+`test_delete_other_users_doc_returns_404` 并断言 404 —— 这个「红灯提醒」机制本身
+起了作用，值得在此留档。
 
 设计思想沿用 test_kb_upload.py：假嵌入 + tmp_path 独立 Chroma，全程不触网、零 API 额度。
 """
@@ -122,24 +123,31 @@ def test_valid_token_opens_the_gate(kb_client):
     assert r.json()["documents"] == []
 
 
-# ============================ 2. 已知越权：本期有意保留 ============================
-def test_kb_endpoints_require_login_but_not_ownership(kb_client, fake_vs):
-    """★ 已知缺口：用户 B 能删掉用户 A 上传的文档，且返回 200。
+# ============================ 2. 归属隔离（P3 起生效） ============================
+def test_delete_other_users_doc_returns_404(kb_client, fake_vs):
+    """★ P3 **翻转**了这条：原先断言「B 删 A 的文档返回 200」，那是刻意保留的已知缺口。
 
-    KB 上传的 metadata 里**不写 user_id**（spec §3 决策 4），服务端因此无从判断归属，
-    任何登录用户都能删任何上传件。这条断言把该行为钉死：P3 补上归属隔离后它会红灯。
+    现在 metadata 带 user_id、删除按归属过滤 → 命中 0 条 → `404 NOT_FOUND`。
+    **刻意不是 403**：403 会泄露「该 doc_id 存在但不属于你」，而 404 与「这 id 根本
+    不存在」不可区分，零额外代码且不泄露存在性（spec 决策 6）。
     """
     a_header = _token(1, "alice")
     a = _upload(kb_client, headers=a_header)
     assert a.status_code == 200, "A 上传本身应当成功"
     doc_id = _done_frame(a.text)["doc_id"]
-    assert fake_vs._collection.count() > 0, "上传后库里应当有向量"
+    before = fake_vs._collection.count()
+    assert before > 0, "上传后库里应当有向量"
 
     b = kb_client.delete(f"/api/kb/documents/{doc_id}", headers=_token(2, "bob"))
 
-    assert b.status_code == 200, "本期不校验归属：B 删 A 的文档会成功"
-    assert b.json()["doc_id"] == doc_id
-    assert fake_vs._collection.count() == 0, "要真的删掉，而不是假成功"
+    assert b.status_code == 404, "P3 起删别人的文档 → 404"
+    assert b.json()["code"] == "NOT_FOUND"
+    assert fake_vs._collection.count() == before, "A 的向量必须一段都没少"
+
+    # 对照组：A 自己删得掉。没有它，上面那条「404」也可能因为删除功能整体坏掉而假通过
+    a2 = kb_client.delete(f"/api/kb/documents/{doc_id}", headers=a_header)
+    assert a2.status_code == 200, "本人删除必须仍然成功"
+    assert fake_vs._collection.count() == 0
 
 
 # ============================ 3. /api/health 保持公开 ============================

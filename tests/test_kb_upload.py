@@ -58,9 +58,12 @@ def client(fake_vs, monkeypatch):
     """挂 kb_router 的测试应用。
 
     KB 三个端点自 P2 起都要求登录，所以这里给整个 client 带上一个 token ——
-    本文件继续聚焦「契约」本身（SSE 时序 / 列表 / 删除幂等），
-    而鉴权门（401、以及"不校验归属"这个已知缺口）由 tests/test_kb_requires_login.py
-    单独守着，两边职责不重叠。
+    本文件继续聚焦「契约」本身（SSE 时序 / 列表 / 删除幂等）。
+
+    token 里的用户是 **id=1**：P3 起上传会写入 user_id，列表与删除又按它过滤，
+    所以「同一个 client 全程用同一个用户」是本文件所有用例成立的前提。
+    跨用户的隔离行为由 tests/test_kb_isolation.py 与 test_kb_requires_login.py 守着，
+    两边职责不重叠。
     """
     # jwt_secret 打桩：别让用例依赖真实 .env 里的密钥
     monkeypatch.setattr(settings, "jwt_secret", "unit-test-secret-" + "0" * 26)
@@ -147,26 +150,31 @@ def test_safe_disk_name_blocks_path_traversal(tmp_path, monkeypatch):
 
 
 def test_rollback_clears_vectors_and_local_copy(fake_vs, tmp_path):
-    """回滚要把向量和落盘原件一起清掉，保证「要么全成，要么库里干干净净」。"""
+    """回滚要把向量和落盘原件一起清掉，保证「要么全成，要么库里干干净净」。
+
+    meta 必须带 user_id：回滚内部走 delete_upload_doc(doc_id, user_id)，而删除是
+    按归属过滤的 —— 漏了 user_id 就会出现「回滚删不掉自己刚写的向量」，半截数据
+    留在库里污染检索（这正是这条测试要防的）。
+    """
     meta = {"doc_id": "d9", "filename": "x.md", "origin": "upload",
-            "uploaded_at": "2026-09-13T00:00:00Z"}
+            "user_id": 1, "uploaded_at": "2026-09-13T00:00:00Z"}
     ft.embed_batch(["a", "b", "c"], meta)
     ft.save_upload_copy("d9", "x.md", b"raw")
 
-    assert upload_service._rollback("d9") == 3
+    assert upload_service._rollback("d9", 1) == 3
     assert fake_vs._collection.count() == 0
     assert not list(settings.uploads_dir.glob("d9__*"))
 
 
 def test_builtin_docs_are_invisible_and_undeletable(fake_vs):
-    """预置文档没有 origin 字段：列表里看不到、按 doc_id 也删不掉（天然 403）。"""
+    """预置文档没有 origin 字段：列表里看不到、按 doc_id 也删不掉（天然 404）。"""
     fake_vs.add_documents([
         Document(page_content="官方文档片段",
                  metadata={"title": "官方", "source": "langchain/x.md", "kb": ft.BUILTIN_KB}),
     ])
-    assert ft.list_upload_docs() == []
+    assert ft.list_upload_docs(1) == []
     assert ft.builtin_stats() == {"docs": 1, "chunks": 1}
-    assert ft.delete_upload_doc("whatever") == 0
+    assert ft.delete_upload_doc("whatever", 1) == 0
     assert fake_vs._collection.count() == 1               # 官方文档没被误删
 
 
