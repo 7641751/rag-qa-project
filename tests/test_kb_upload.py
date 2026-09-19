@@ -31,7 +31,8 @@ from langchain_core.documents import Document
 from langchain_core.embeddings import DeterministicFakeEmbedding
 
 from config import settings
-from backend.app import function_tools as ft
+from backend.tools import security as sec
+from backend.tools import upload_function_tools as ft
 from backend.app.api import kb_router
 from backend.app.services import upload_service
 
@@ -41,7 +42,7 @@ from backend.app.services import upload_service
 def fake_vs(tmp_path, monkeypatch):
     """每个测试一份独立 Chroma（tmp_path 隔离），嵌入用假模型，原件落到 tmp_path。
 
-    function_tools 里所有读写都通过 get_vectorstore() 现取，
+    upload_function_tools 里所有读写都通过 get_vectorstore() 现取，
     所以只要把这个名字换掉，整条链路就都跑在假库上。
     """
     vs = Chroma(collection_name="kb_test",
@@ -53,10 +54,21 @@ def fake_vs(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def client(fake_vs):
+def client(fake_vs, monkeypatch):
+    """挂 kb_router 的测试应用。
+
+    KB 三个端点自 P2 起都要求登录，所以这里给整个 client 带上一个 token ——
+    本文件继续聚焦「契约」本身（SSE 时序 / 列表 / 删除幂等），
+    而鉴权门（401、以及"不校验归属"这个已知缺口）由 tests/test_kb_requires_login.py
+    单独守着，两边职责不重叠。
+    """
+    # jwt_secret 打桩：别让用例依赖真实 .env 里的密钥
+    monkeypatch.setattr(settings, "jwt_secret", "unit-test-secret-" + "0" * 26)
     app = FastAPI()
     app.include_router(kb_router.router)
-    return TestClient(app)
+    c = TestClient(app)
+    c.headers.update({"Authorization": f"Bearer {sec.create_access_token(1, 'kb_tester')}"})
+    return c
 
 
 def _parse_sse(body: str) -> list[tuple[str, dict]]:
@@ -306,8 +318,10 @@ def test_delete_document_is_idempotent_404(client, fake_vs):
 def test_app_registers_kb_routes():
     """整条 import 链（backend.app.api.main）能通，且三个 kb 端点都挂上了。
 
-    这条守住的是「多根混用」回归：function_tools / upload_service / kb_router
-    必须统一用 backend.app.* 绝对导入，写成裸 services.* / agent.* 会直接 ImportError。
+    这条守住的是「多根混用」回归：源码根只有 rag_qa_project/ 一个，所以
+    upload_function_tools（物理位置在 backend/tools/）必须写成 backend.tools.*，
+    upload_service / kb_router 必须写成 backend.app.*；写成裸 tools.* /
+    services.* / agent.* 会在命令行直接 ModuleNotFoundError（IDE 里可能不报红）。
     """
     from backend.app.api.main import app as real_app
 

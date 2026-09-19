@@ -1,20 +1,32 @@
 # -*- coding: utf-8 -*-
 """知识库端点（契约 docs/api/README.md「知识库端点」）。"""
 import asyncio
+from typing import Annotated
 
-from fastapi import APIRouter, File, UploadFile
+from fastapi import APIRouter, File, UploadFile, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.app.function_tools import (
-    builtin_stats, delete_upload_doc, err, get_upload_doc, list_upload_docs,
+from backend.app.agent.schemas import AuthUser
+from backend.app.api.deps import get_current_user
+from backend.tools.http_tools import err
+from backend.tools.upload_function_tools import (
+    builtin_stats, delete_upload_doc, get_upload_doc, list_upload_docs,
     remove_upload_copies,
 )
 from backend.app.services import upload_service
+from backend.tools.mysql_db_tools import get_db_session
+from backend.app.services import conversation_service
 
 router = APIRouter(prefix="/api/kb", tags=["kb"])
+DbSession = Annotated[AsyncSession, Depends(get_db_session)]
+CurrentUser = Annotated[AuthUser, Depends(get_current_user)]
 
-
+# 以下三个端点都要求登录，但**本期不校验归属**（spec §3 决策 4）：上传件的 metadata 里
+# 不写 user_id，服务端无从判断某个 doc_id 属于谁，所以 _user 只声明、不使用。
+# 用 `_` 前缀是刻意的 —— 标明"这里故意不用它"，免得后人误以为漏了校验，或顺手补一个
+# 拿不到依据的 owner 判断。归属隔离留待 P3（届时 metadata 加 user_id + 检索过滤）。
 @router.post("/documents")
-async def upload_documents(file: UploadFile = File(...)):
+async def upload_documents(_user: CurrentUser, file: UploadFile = File(...)):
     """上传文档入库，以 SSE 流式返回处理进度（progress × N → done）。
 
     ⚠ 必须 return：sse_upload 给出的是 StreamingResponse / JSONResponse，
@@ -24,7 +36,7 @@ async def upload_documents(file: UploadFile = File(...)):
 
 
 @router.get("/documents")
-async def get_documents():
+async def get_documents(_user: CurrentUser):
     """列出用户上传的文档，用于抽屉的文件列表。
 
     只含 origin="upload"，按 uploaded_at 倒序；空库返回 200 + 空列表，不报 404。
@@ -38,12 +50,14 @@ async def get_documents():
 
 
 @router.delete("/documents/{doc_id}")
-async def delete_document(doc_id: str):
+async def delete_document(doc_id: str, _user: CurrentUser, db_session: DbSession):
     """删除某上传文档的全部向量块，同时清掉 data/uploads/ 里的落盘原件。
 
     过滤条件含 origin=upload，所以预置的官方文档天然删不掉（命中 0 条 → 404），
     无需额外的 403 分支；重复删同一 doc_id 第二次也是 404 而不是 500（幂等）。
     """
+
+
     target = await asyncio.to_thread(get_upload_doc, doc_id)
     if target is None:
         return err(404, "NOT_FOUND", f"文档不存在: {doc_id}")

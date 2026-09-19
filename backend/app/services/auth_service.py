@@ -1,4 +1,3 @@
-from agent.schemas import AuthUser
 """注册与登录的业务逻辑。密码哈希/JWT 签发复用 tools/security.py。"""
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
