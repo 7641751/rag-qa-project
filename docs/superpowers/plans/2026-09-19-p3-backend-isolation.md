@@ -12,18 +12,57 @@
 
 ---
 
-## 执行状态（2026-09-19 起始）
+## 执行状态（2026-09-19 **已完成**）
 
-| 事实 | 证据 |
-|---|---|
-| 基线 **RED** | `tests/test_graph.py` 5 errors：`TypeError: build_graph() got an unexpected keyword argument 'retriever'` |
-| 图改造**只做了一半** | `graph.py:124` 与 `:128` 已改（vectorstore + filter），但 `:237` 仍是 `get_retriever()` |
-| `:237` 是**线上阻断** | `get_retriever()` 返回 `VectorStoreRetriever`，实测**没有** `similarity_search` → `retrieve` 节点抛 `AttributeError`；而 `chat_service.py:20,88` 都是裸 `get_graph()`，不注入 |
-| `RAGState.user_id` 已加 | `schemas.py:16` ✓ |
-| `kb_filter` 已写但位置错 | `graph.py:272`，在 `get_graph()` **之后**，且缩进 3 空格 |
-| `scripts/` 目录不存在 | 迁移脚本要新建 |
+| Task | 提交 | 结果 |
+|---|---|---|
+| 0 收尾图改造 | `d589291` | ✅ 修循环导入（起始有 5 个 collection error）+ 删 `get_retriever` + `FakeVectorStore` |
+| 1 filter 三条防线 | `c13f5b4` | ✅ 含变异检查（喂入 `origin=builtin` 立即红） |
+| 2 user_id 进 state | `57e6e71` | ✅ |
+| 3+4+5 KB 归属隔离 | `6fe765b` | ✅ 四查询函数 + meta + 三端点；★ 翻转了 `test_kb_requires_login` 的越权断言（200 → 404） |
+| 6+7 会话列表/重命名 | `b42c03a` | ✅ 含 onupdate 抑制（变异检查已验证） |
+| 8 端点级隔离测试 | `6090779` | ✅ §12.1 #8/#9 |
+| 9 迁移脚本 | `5e449f8` | ✅ 含跑 CLI 才发现的两个 bug |
+| 10 契约与文档 | `bf80117` | ✅ |
+| 11 手工验收 | — | ✅ **14/14**（真实 MySQL + 真实 Chroma） |
 
-**测试基线**：后端现有 14 个测试文件。Task 0 完成后必须全绿，之后每个 Task 只允许「全绿 → 全绿」。
+**测试**：后端 起始 `5 errors during collection` → **172 passed, 1 skipped**；前端 **148 passed / 14 files**。
+
+### 执行中的关键实测发现
+
+1. **循环导入（Task 0，起始阻断）**：`graph.py` 顶层 `import BUILTIN_KB` 与 `upload_function_tools:29` 的反向 import 成环 → 5 个测试文件连收集都失败。改为 `kb_filter` 内延迟 import。
+2. **`build_graph` 的 `get_retriever()`（Task 0）**：`VectorStoreRetriever` **没有** `similarity_search`（实测），而 `chat_service.py:20,88` 都是裸 `get_graph()` → 线上问任何问题都会 `AttributeError`。
+3. **`onupdate` 会刷新 `updated_at`（Task 6）**：朴素 `row.title = x` 会让「重命名」把会话顶到列表最前，破坏排序语义。用 Core update 显式写回 `updated_at` 抑制（变异检查已验证测试有效）。
+4. **ISO 8601 缺 `Z`（Task 7）**：库里是 naive UTC，Pydantic 默认输出不带 `Z`，而 JS `new Date()` 会把无 `Z` 形式按**本地时区**解析 → 相对时间整体偏一个时区。加 `field_serializer` 补 `Z`。
+5. **迁移脚本的两个 CLI bug（Task 9，测试覆盖不到）**：① 中文 Windows 控制台 GBK 下打印 `✔`/`✘` 抛 `UnicodeEncodeError`（连「拒绝执行」提示都打不出来）；② `asyncio.run` 返回后 aiomysql 连接在 `__del__` 里 close 抛 `Event loop is closed`，使脚本「成功却带着 traceback 结束」。
+6. **数据不一致（Task 9 实测）**：向量库有 **21** 个上传文档，而 `data/uploads/` 只有 **20** 个原件 —— 多出的 `5230cdcc-…__可重入锁.md`（7 段）**只有向量、没有原件**。spec 的「20 个」是从磁盘数的。迁移会一并补它的 `user_id`（无害），但它没有原件，`ingest.py --force` 重建后会**永久丢失**。
+
+### 验收证据（Task 11，真实 MySQL + 真实 Chroma）
+
+```
+PASS  新用户会话列表 = 200 {threads:[],total:0}
+PASS  新用户 KB 列表为空，但 builtin 全局可见(88 篇)
+PASS  PATCH 不存在的会话 -> 404 NOT_FOUND
+PASS  PATCH 标题空/纯空格/超60 -> 422 契约错误体
+PASS  无 token -> 401 UNAUTHORIZED
+    [retrieve] 命中 4 段: ['Checkpointers', 'Checkpointers', 'Checkpointers', 'Memory']
+    [grade] 4/4 段判定为相关
+PASS  ** 提问 grounded=True（88 篇预置仍可检索）**
+PASS  提问后会话进列表：title=首问前20字、时间戳带 Z
+PASS  PATCH 本人会话 -> 200 且标题已 trim
+PASS  重命名不改 updated_at（排序语义）
+PASS  ** B 的会话列表为空（看不到 A 的）**
+PASS  ** B 重命名 A 的会话 -> 403 FORBIDDEN**
+PASS  ** B 的 KB 列表为空，builtin 仍 88 篇**
+PASS  DELETE 本人会话 -> 200 deleted=true
+14/14 passed
+```
+
+> 验收脚本在真实库里建了两个用户（`accA*` / `accB*`，id 6/7）用于验证隔离，需要清理可直接删 `users` 表对应行。
+
+### 尚未执行的一步
+
+**迁移脚本没有真正跑**（只跑了 `--dry-run`）。它必须在**部署 P3 代码之前**执行，否则旧上传件对所有人不可见。当前状态：待迁移 **820 段 / 21 个文档**，归属用户 `61014(id=1)`。
 
 ---
 
