@@ -30,7 +30,7 @@ export default function App() {
     return <LoginPage onLogin={auth.login} onRegister={auth.register} error={auth.error} />;
   }
 
-  return <AuthedApp />;
+  return <AuthedApp onLogout={auth.logout} username={auth.user?.username ?? null} />;
 }
 
 /** 已登录后的主界面。
@@ -41,7 +41,12 @@ export default function App() {
  *
  *  Hooks 不能条件调用，所以「拆组件」是这里唯一干净的解法。
  */
-function AuthedApp() {
+interface AuthedAppProps {
+  onLogout: () => void;
+  username?: string | null;
+}
+
+function AuthedApp({ onLogout, username }: AuthedAppProps) {
   const {
     messages, streaming, send, abort, newChat,
     deleteChat, deleting, deleteError, clearDeleteError,
@@ -60,6 +65,10 @@ function AuthedApp() {
         kbBadge={kb.activeCount}
         canDelete={messages.length > 0 || streaming}
         onDeleteChat={() => { clearDeleteError(); setConfirmDelete(true); }}
+        username={username}
+        // 正在生成时先 abort 再退出：否则那条流还在跑（后端白跑一次 LLM 调用），
+        // 而组件已卸载，这半截回答再也回不到界面上。
+        onLogout={() => { if (streaming) abort(); onLogout(); }}
       />
       <ChatWindow messages={messages} />
       <Composer streaming={streaming} onSend={send} onStop={abort} />

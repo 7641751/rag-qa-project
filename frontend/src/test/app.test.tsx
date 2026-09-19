@@ -28,7 +28,7 @@ vi.mock('../api/client', () => ({
 }));
 
 import App from '../App';
-import { setToken } from '../api/tokenStore';
+import { getToken, setToken } from '../api/tokenStore';
 
 const flush = () => act(async () => { await new Promise(r => setTimeout(r, 0)); });
 const mdFile = () => new File(['# hi'], 'a.md', { type: 'text/markdown' });
@@ -176,5 +176,18 @@ describe('App 集成', () => {
     expect(screen.queryByTestId('login-page')).not.toBeInTheDocument();
     expect(screen.getByText('📚 知识库')).toBeInTheDocument();
     expect(fetchMeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('点「退出」→ 清 token 并回到登录页', async () => {
+    render(<App />);
+    await flush();
+    expect(screen.getByText('📚 知识库')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId('btn-logout'));
+    await flush();
+
+    expect(screen.getByTestId('login-page')).toBeInTheDocument();
+    expect(screen.queryByText('📚 知识库')).not.toBeInTheDocument();
+    expect(getToken()).toBeNull();                       // 真的清了凭证，不只是切了视图
   });
 });
