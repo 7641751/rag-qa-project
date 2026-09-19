@@ -51,18 +51,26 @@ def _parse_sse(frames: list[str]) -> list[tuple[str, dict]]:
     return out
 
 
-def _run_stream(monkeypatch, relevance_mode: str,
-                question: str = "LangGraph 怎么做持久化？") -> list[tuple[str, dict]]:
-    """把 chat_service.get_graph 换成假件编译的图，跑完 stream_chat 并解析成事件列表。"""
+def _run_stream_with_vs(monkeypatch, relevance_mode: str,
+                        question: str = "LangGraph 怎么做持久化？",
+                        user_id: int | None = None):
+    """同 _run_stream，但把**向量库替身也返回** —— 否则断言不了检索收到的 filter。"""
+    vs = FakeVectorStore()
     app = build_graph(model=FakeRAGModel(responses=[], relevance_mode=relevance_mode),
-                      vectorstore=FakeVectorStore(), checkpointer=InMemorySaver())
+                      vectorstore=vs, checkpointer=InMemorySaver())
     monkeypatch.setattr(chat_service, "get_graph", lambda: app)
     req = ChatRequest(question=question, thread_id="t-stream")
 
     async def go():
-        return [frame async for frame in chat_service.stream_chat(req)]
+        return [frame async for frame in chat_service.stream_chat(req, user_id=user_id)]
 
-    return _parse_sse(asyncio.run(go()))
+    return _parse_sse(asyncio.run(go())), vs
+
+
+def _run_stream(monkeypatch, relevance_mode: str,
+                question: str = "LangGraph 怎么做持久化？") -> list[tuple[str, dict]]:
+    """把 chat_service.get_graph 换成假件编译的图，跑完 stream_chat 并解析成事件列表。"""
+    return _run_stream_with_vs(monkeypatch, relevance_mode, question)[0]
 
 
 @pytest.fixture
@@ -141,6 +149,30 @@ def test_happy_path_emits_generation_and_sources(monkeypatch):
     assert "模拟回答" in "".join(t["text"] for t in by_event["token"])
     assert [s["title"] for s in by_event["sources"][0]["sources"]] == ["Persistence", "Messages"]
     assert by_event["done"][0] == {"thread_id": "t-stream", "rewrites": 0, "grounded": True}
+
+
+# ============================ 3. 检索按用户隔离（P3） ============================
+def test_stream_injects_user_id_into_retrieval_filter(monkeypatch):
+    """★ P3 核心：stream_chat 必须把调用方 user_id 写进 state，retrieve 才拿得到它。
+
+    漏注入的后果是 state 里没有该键 → `kb_filter(None)` → **用户检索不到自己上传的
+    文档**，而且不报任何错（只是答案悄悄变差），属于最难发现的那类 bug。
+    """
+    frames, vs = _run_stream_with_vs(monkeypatch, relevance_mode="all", user_id=7)
+
+    assert vs.calls[0]["filter"] == {"$or": [{"kb": "langchain_docs"}, {"user_id": 7}]}
+    assert [e for e, _ in frames][-1] == "done"      # 注入 user_id 不影响事件序
+
+
+def test_stream_without_user_id_sees_only_builtin(monkeypatch):
+    """不传 user_id（CLI `run.py` 等无登录态路径）→ 只见预置文档，**不是报错**。
+
+    这是刻意行为（spec §14），但若被误当成 bug 去「修」，就会变成任何人都能检索
+    全部上传件 —— 那才是真问题。用测试把当前语义钉住。
+    """
+    _, vs = _run_stream_with_vs(monkeypatch, relevance_mode="all", user_id=None)
+
+    assert vs.calls[0]["filter"] == {"kb": "langchain_docs"}
 
 
 def test_partial_relevance_keeps_only_relevant_in_sources(monkeypatch):

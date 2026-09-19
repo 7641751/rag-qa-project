@@ -16,10 +16,13 @@ LABELS = {"retrieve": "检索", "grade_documents": "评分",
           "rewrite_query": "重写", "generate": "生成"}
 
 
-async def stream_chat(chat_request: ChatRequest):
+async def stream_chat(chat_request: ChatRequest, user_id: int | None = None):
     graph = get_graph()
+    # user_id 必须进 state：retrieve 节点靠它生成本轮检索的 filter（kb_filter，P3）。
+    # 显式写入 None 而不是省略该键 —— 便于日后再排查「这次到底注入的是什么」，
+    # 且 RAGState 是 TypedDict、两者取值行为相同，成本为零。
     state = {"question": chat_request.question, "documents": [],
-             "generation": "", "rewrites": 0}
+             "generation": "", "rewrites": 0, "user_id": user_id}
     config = {"configurable": {"thread_id": chat_request.thread_id}}
     final_docs, rewrites, gen_step_sent, gen_text = [], 0, False, ""
     try:
@@ -150,4 +153,4 @@ async def prepare_stream(chat_request: ChatRequest, user_id: int,
         db, thread_id=chat_request.thread_id, user_id=user_id,
         question=chat_request.question)
     await db.commit()
-    return stream_chat(chat_request)
+    return stream_chat(chat_request, user_id)
