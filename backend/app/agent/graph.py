@@ -19,7 +19,11 @@
   且第 2 次改写的「原始问题」会变成第 1 次的输出（关键词漂移叠加）。
 - **空召回不走 grade**：0 条候选时它的提示词会退化成「编号 1..0 / 输出 0 个布尔值」，
   结构化输出拿不到合法 JSON，整轮以报错结束，用户反而拿不到兜底答案。
+- **改写的触发门槛由 `settings.grade_strict` 决定**：False（默认）时「保留数不到召回数
+  一半」就改写；True 时只有「一条都没留下」才改写。grade 的判定标准是「宁可多留、
+  不可误删」，所以在 True 之下改写几乎永不触发，纠错回路形同虚设。
 """
+import logging
 from functools import lru_cache
 
 import aiosqlite
@@ -30,6 +34,16 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from backend.app.agent.schemas import RAGState, GradeDocuments, RewrittenQuery
 from config import settings
+
+logger = logging.getLogger(__name__)
+
+
+class RetrievalError(RuntimeError):
+    """检索层失败（向量库读不出来、Chroma 打不开、嵌入服务不可用…）。
+
+    存在的唯一目的：让上层能把「检索失败」与「LLM 失败」分开报。
+    两者都归成 LLM_ERROR 时，用户会去查模型与额度，而真正坏的是向量库。
+    """
 
 
 # ---------- 工厂 ----------
@@ -141,6 +155,25 @@ _UNGROUNDED_RULES = """你是 LangChain / LangGraph 以及用户上传文档的�
 5. 结尾可建议用户：换更具体的术语重试，或把相关文档上传到知识库后再问。
 6. 如果问题完全超出你的能力范围，就只输出声明加上“这个问题我无法可靠回答”，不要硬答。"""
 
+# grade 的判定标准：稳定不变。**提到模块级**而不是埋在节点函数体里 ——
+# 这是整套图里最常被调的判据（它直接决定改写触发与否），集中后才便于对比与复用。
+_GRADE_RULES = """你是检索质量评审员。知识库是 LangChain / LangGraph 的英文官方文档和上传的文档。
+
+判定标准（宁可多留、不可误删）：
+- True：能直接回答问题；或仅部分相关；或需与其他片段组合才能回答；或含问题所涉及的关键概念 / API / 术语；
+- False：讨论的是完全无关的主题。
+片段已被截断，看不到全貌时请倾向判 True。"""
+
+# rewrite 的改写规则：同样提到模块级。
+_REWRITE_RULES = """你是检索查询改写器。知识库是 LangChain / LangGraph 的**英文**官方文档和上传的文档，向量检索对英文查询命中更准。
+
+上一轮检索没有找到足够相关的文档。请把问题改写成更适合向量检索的查询：
+1. 输出**英文**查询；专有名词保持原样（如 checkpointer / StateGraph / tool calling）；若原问题是中文，先译成英文再补关键词；
+2. 展开缩写与口语表达，补上同义术语与上位概念，提高召回；
+3. 结合最近对话补全指代，使查询自包含（脱离对话也能看懂）；
+4. 保持疑问语义，不要变成陈述句，不要添加无关词；
+5. 只输出改写后的查询本身，不要解释。"""
+
 
 def _recent_dialogue(state: RAGState, limit: int = 4, chars: int = 200) -> str:
     """取最近 limit 条对话（每条截断到 chars），供改写时补全指代。无历史返回空串。"""
@@ -159,11 +192,18 @@ def _make_nodes(model, vectorstore):
     def retrieve(state: RAGState):
         # 有改写就用改写后的查询（向量检索享受改写红利），否则用用户原话。
         query = state.get("search_query") or state["question"]
-        docs = vectorstore.similarity_search(query, k=settings.top_k,
-                                             filter=kb_filter(state.get("user_id")))
+        try:
+            docs = vectorstore.similarity_search(query, k=settings.top_k,
+                                                 filter=kb_filter(state.get("user_id")))
+        except Exception as exc:
+            # 包成 RetrievalError，让上层能把它与 LLM 失败分开报（否则用户看到
+            # 「LLM 错误」会去查模型和额度，而真正坏的是向量库）。
+            raise RetrievalError(f"{type(exc).__name__}: {exc}") from exc
         print(f"    [retrieve] 命中 {len(docs)} 段: "
               f"{[d.metadata.get('title', '?') for d in docs]}")
-        return {"documents": docs}
+        # retrieved_count 单独记：documents 会被 grade 覆盖成「保留」的子集，
+        # 覆盖后就无从判断「召回了几条、留下几条」——而那正是 grade_strict 的门槛依据。
+        return {"documents": docs, "retrieved_count": len(docs)}
 
     def grade_documents(state: RAGState):
         docs = state["documents"]
@@ -186,17 +226,21 @@ def _make_nodes(model, vectorstore):
         query_block = (f"问题：{state['question']}\n检索查询：{search}"
                        if search else f"问题：{state['question']}")
         result = grader.invoke(
-            f"你是检索质量评审员。知识库是 LangChain / LangGraph 的英文官方文档和上传的文档。\n\n"
-            f"{query_block}\n\n"
+            f"{_GRADE_RULES}\n\n{query_block}\n\n"
             f"候选文档共 {n} 条（编号 1..{n}，每条已截断到前 {preview} 字符）：\n"
             f"{numbered}\n\n"
-            f"判定标准（宁可多留、不可误删）：\n"
-            f"- True：能直接回答问题；或仅部分相关；或需与其他片段组合才能回答；"
-            f"或含问题所涉及的关键概念 / API / 术语；\n"
-            f"- False：讨论的是完全无关的主题。\n"
-            f"片段已被截断，看不到全貌时请倾向判 True。\n\n"
             f"请按编号顺序输出 {n} 个布尔值，第 i 个对应编号为 i 的文档，不要多也不要少。")
-        kept = [d for d, ok in zip(docs, result.relevance) if ok]
+
+        # ⚠ 判定数必须与候选数对齐后再配对。直接用 zip 会**按短的截断** ——
+        # 模型少返一个判定，末尾文档就被当成「不相关」静默丢掉，而日志只显示
+        # 「k/n 段相关」，看不出是判为不相关还是模型少返了。取向与提示词的
+        # 「宁可多留、不可误删」一致：缺失的判定补 True（保守保留）。
+        flags = list(result.relevance)
+        if len(flags) != n:
+            logger.warning("[grade] 判定数 %d != 候选数 %d，按「宁可多留」补齐/截断为 %d",
+                           len(flags), n, n)
+            flags = (flags + [True] * n)[:n]
+        kept = [d for d, ok in zip(docs, flags) if ok]
         print(f"    [grade] {len(kept)}/{n} 段判定为相关")
         return {"documents": kept}
 
@@ -208,16 +252,8 @@ def _make_nodes(model, vectorstore):
                          if dialogue else "")
         attempt = state["rewrites"] + 1
         result = rewriter.invoke(
-            f"你是检索查询改写器。知识库是 LangChain / LangGraph 的**英文**官方文档和上传的文档，"
-            f"向量检索对英文查询命中更准。{history_block}\n\n"
+            f"{_REWRITE_RULES}{history_block}\n\n"
             f"原始问题：{state['question']}\n\n"
-            f"上一轮检索没有命中任何相关文档。请把问题改写成更适合向量检索的查询：\n"
-            f"1. 输出**英文**查询；专有名词保持原样（如 checkpointer / StateGraph / tool calling）；"
-            f"若原问题是中文，先译成英文再补关键词；\n"
-            f"2. 展开缩写与口语表达，补上同义术语与上位概念，提高召回；\n"
-            f"3. 结合最近对话补全指代，使查询自包含（脱离对话也能看懂）；\n"
-            f"4. 保持疑问语义，不要变成陈述句，不要添加无关词；\n"
-            f"5. 只输出改写后的查询本身，不要解释。\n\n"
             f"这是第 {attempt} 次改写（最多 {settings.max_rewrites} 次），"
             f"请比上一次更宽泛、更关键词化。")
         print(f"    [rewrite] 第 {attempt} 次重写: {result.query}")
@@ -286,7 +322,25 @@ def _decide_after_retrieve(state: RAGState):
 
 
 def _decide_to_generate(state: RAGState):
-    if state["documents"]:
+    """grade 之后：留下的够不够用来回答？不够且还能改写就再改写一轮。
+
+    「够不够」的判据由 `settings.grade_strict` 决定（config.py 里写好的语义）：
+    - `True` ：只要留下**一条**就算够。改编写几乎永不触发 —— grade 的判定标准是
+      「宁可多留、不可误删」，两者叠加的结果是「召回质量差但非零」时没有任何
+      自我纠正的机会。
+    - `False`（默认）：保留数**不到召回数一半**就不够，值得再改写一轮。
+
+    两种模式下「一条都没留下」都必须改写 —— 那是原实现就有的、且必须保留的行为。
+    """
+    kept = len(state["documents"])
+    if kept == 0:
+        enough = False
+    elif settings.grade_strict:
+        enough = True
+    else:
+        enough = kept * 2 >= (state.get("retrieved_count") or 0)
+
+    if enough:
         return "generate"
     if state["rewrites"] < settings.max_rewrites:
         return "rewrite"

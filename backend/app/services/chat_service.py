@@ -12,7 +12,7 @@ from backend.app.agent.schemas import (
     ChatRequest, RAGState, HistoryResponse, HistoryMessage, ChatDeleteResponse,
     ConversationSummary, ThreadListResponse, RenameResponse,
 )
-from backend.app.agent.graph import build_graph, get_graph
+from backend.app.agent.graph import RetrievalError, build_graph, get_graph
 from backend.app.services import conversation_service
 
 LABELS = {"retrieve": "检索", "grade_documents": "评分",
@@ -71,6 +71,11 @@ async def stream_chat(chat_request: ChatRequest, user_id: int | None = None):
 
         yield sse("done", {"thread_id": chat_request.thread_id, "rewrites": rewrites,
                            "grounded": bool(final_docs)})
+    except RetrievalError as exc:
+        # 检索层失败 ≠ LLM 失败。两者都报 LLM_ERROR 会把排查方向带偏 ——
+        # 用户看到「LLM 错误」会去查模型与额度，而真正坏的是向量库。
+        # 零契约变更：INTERNAL_ERROR 本就在错误码表里，前端按 message 展示即可。
+        yield sse("error", {"code": "INTERNAL_ERROR", "message": f"检索失败：{exc}"})
     except Exception as exc:
         yield sse("error", {"code": "LLM_ERROR", "message": f"{type(exc).__name__}: {exc}"})
 

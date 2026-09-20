@@ -12,6 +12,8 @@ class RAGState(TypedDict):
     question: str           # **用户原话，全程不被覆写**（改写只动 search_query）
     search_query: str       # 改写后的检索查询；未发生改写时**该键不存在**
     documents: list  # 整体覆盖语义：retrieve / grade 每次返回完整新列表
+    retrieved_count: int    # retrieve 的**原始召回条数**。grade 会覆盖 documents，
+                            # 覆盖后就无从判断保留率了 —— 而那是 grade_strict 的门槛依据
     generation: str
     rewrites: int # 已重写次数
     messages: Annotated[list, add_messages]  # 累积对话历史

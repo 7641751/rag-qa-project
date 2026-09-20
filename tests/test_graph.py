@@ -454,3 +454,98 @@ def test_grade_node_with_empty_documents_is_a_noop(base_state):
 
     assert out == {"documents": []}
     assert model.seen == [], "0 条候选时必须短路，不能构造退化提示词去调模型"
+
+
+# ============================ 7. P1 修复 ============================
+def _three_docs():
+    """3 段候选。取 3 而不是 2 是为了能构造「保留 1/3」——门槛是「不到一半」，
+    2 段里留 1 段刚好是一半（达标），测不出门槛。"""
+    return [Document(page_content=f"片段 {i}", metadata={"title": f"T{i}"}) for i in range(3)]
+
+
+# ---------- P1-③ 纠错回路的触发门槛（接线 dead config grade_strict） ----------
+def test_partial_hits_trigger_rewrite_when_not_strict(base_state, monkeypatch):
+    """★ P1-③：非严格模式下，保留数**不到召回数一半**就再改写一轮。
+
+    这是「纠错回路基本闲置」的修复。grade 的判定标准是「宁可多留、不可误删」，
+    叠加原先「只有一条都没留下才改写」的触发条件，改写几乎永不发生 ——
+    中文问英文库、召回质量差但非零的场景完全没有自我纠正的机会。
+    """
+    monkeypatch.setattr(settings, "grade_strict", False)
+    app = build_graph(model=_model(relevance_mode="first"),
+                      vectorstore=FakeVectorStore(docs=_three_docs()),
+                      checkpointer=InMemorySaver())
+
+    result = app.invoke(base_state, config={"configurable": {"thread_id": "t-off"},
+                                            "recursion_limit": 25})
+
+    # 每轮都只留 1/3 → 一路改写到上限
+    assert result["rewrites"] == settings.max_rewrites, "1/3 保留太差，应当改写后再试"
+
+
+def test_partial_hits_generate_when_strict(base_state, monkeypatch):
+    """严格模式（本次改动前的行为）：只要留下一条就直接作答，不改写。"""
+    monkeypatch.setattr(settings, "grade_strict", True)
+    app = build_graph(model=_model(relevance_mode="first"),
+                      vectorstore=FakeVectorStore(docs=_three_docs()),
+                      checkpointer=InMemorySaver())
+
+    result = app.invoke(base_state, config={"configurable": {"thread_id": "t-on"},
+                                            "recursion_limit": 25})
+
+    assert result["rewrites"] == 0
+    assert len(result["documents"]) == 1
+
+
+def test_nothing_kept_rewrites_in_both_modes(base_state, monkeypatch):
+    """两种模式下「一条都没留下」都必须改写 —— 严格模式不能顺手把这条也关掉。"""
+    monkeypatch.setattr(settings, "grade_strict", True)
+    app = build_graph(model=_model(relevance_mode="none"),
+                      vectorstore=FakeVectorStore(docs=_three_docs()),
+                      checkpointer=InMemorySaver())
+
+    result = app.invoke(base_state, config={"configurable": {"thread_id": "t-none"},
+                                            "recursion_limit": 25})
+
+    assert result["rewrites"] == settings.max_rewrites
+
+
+# ---------- P1-④ 判定数不匹配时不得静默丢文档 ----------
+class _ShortVerdictModel(FakeRAGModel):
+    """故意少返一个判定，模拟真实模型没遵守「不要多也不要少」的情况。"""
+
+    def _relevance_flags(self, n: int, prompt_text: str):
+        return [True] * (n - 1)
+
+
+class _LongVerdictModel(FakeRAGModel):
+    """多返两个判定。"""
+
+    def _relevance_flags(self, n: int, prompt_text: str):
+        return [True] * (n + 2)
+
+
+def test_grade_keeps_tail_docs_when_model_returns_fewer_verdicts(base_state):
+    """★ P1-④：模型少返判定时，末尾文档必须**保守保留**。
+
+    原实现 `zip(docs, result.relevance)` 按短的截断 → 末尾文档被当作不相关丢掉，
+    而日志只显示「k/n 段相关」，看不出是「判为不相关」还是「模型少返了」——
+    静默的质量损失。取向与 grade 提示词的「宁可多留、不可误删」保持一致：补 True。
+    """
+    docs = _three_docs()
+    _, grade, _, _ = _make_nodes(_ShortVerdictModel(responses=[]), FakeVectorStore())
+
+    out = grade({**base_state, "documents": docs})
+
+    assert len(out["documents"]) == len(docs), (
+        f"模型只给了 2 个判定，第 3 段被丢掉了：{len(out['documents'])}/{len(docs)}")
+
+
+def test_grade_truncates_extra_verdicts(base_state):
+    """多返判定时按候选数截断 —— 多出来的判定没有对应文档，不该凭空造出文档。"""
+    docs = _three_docs()
+    _, grade, _, _ = _make_nodes(_LongVerdictModel(responses=[]), FakeVectorStore())
+
+    out = grade({**base_state, "documents": docs})
+
+    assert len(out["documents"]) == len(docs)

@@ -189,6 +189,33 @@ def test_empty_kb_emits_fallback_not_error(monkeypatch):
     assert vs.calls, "仍然应该先尝试检索一次"
 
 
+def test_retrieval_failure_is_not_labelled_llm_error(monkeypatch):
+    """★ P1-⑤：向量库读失败不该被报成 `LLM_ERROR`。
+
+    `stream_chat` 的兜底 except 原先把所有异常都归为 LLM_ERROR，于是「Chroma 挂了」
+    在用户侧显示为「LLM 错误」—— 排查时会被指向错误的方向。
+    这里换成 INTERNAL_ERROR（**零契约变更**：该码本就存在）+ message 指明是哪一层。
+    """
+    class ExplodingVS:
+        """一检索就炸的向量库替身。"""
+        def similarity_search(self, *a, **kw):
+            raise RuntimeError("chroma 打不开")
+
+    app = build_graph(model=FakeRAGModel(responses=[], relevance_mode="all"),
+                      vectorstore=ExplodingVS(), checkpointer=InMemorySaver())
+    monkeypatch.setattr(chat_service, "get_graph", lambda: app)
+
+    async def go():
+        req = ChatRequest(question="q", thread_id="t-explode")
+        return [frame async for frame in chat_service.stream_chat(req, user_id=1)]
+    frames = _parse_sse(asyncio.run(go()))
+
+    errs = [d for e, d in frames if e == "error"]
+    assert errs, "检索失败必须发 error 帧"
+    assert errs[0]["code"] == "INTERNAL_ERROR", f"不该标成 LLM_ERROR：{errs[0]}"
+    assert "检索" in errs[0]["message"], f"message 要指明失败的是哪一层：{errs[0]}"
+
+
 def test_stream_without_user_id_sees_only_builtin(monkeypatch):
     """不传 user_id（CLI `run.py` 等无登录态路径）→ 只见预置文档，**不是报错**。
 

@@ -66,7 +66,14 @@ class Settings(BaseSettings):
 
     # ---- 工作流 ----
     max_rewrites: int = 2             # 查询重写最大次数（防死循环）
-    grade_strict: bool = True         # True: 全部文档不相关才重写；False: 低于半数即重写
+    # 改写的触发门槛：
+    #   False（默认）保留数**不到召回数一半**就改写 —— 纠错回路才真正起作用
+    #   True         只有「一条都没留下」才改写（改动前的行为）
+    # 为什么默认 False：grade 的判定标准是「宁可多留、不可误删」，叠加 True 之后
+    #   改写几乎永不触发，中文问英文库这类「召回质量差但非零」的场景完全无法自我纠正。
+    # 代价：改写会多花 LLM 调用（每轮改写 + 重新评分，最多 2×(1+1) 次）。
+    # 退回旧行为：设环境变量 RAGQA_GRADE_STRICT=true
+    grade_strict: bool = False
 
     # ---- 路径 ----
     data_dir: Path = PROJECT_DIR / "data"
