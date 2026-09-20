@@ -261,6 +261,28 @@ def first_hit_rank(docs: list[Document], expected: list[str]) -> int | None:
     return None
 
 
+def missing_expected(queries: list[dict], docs: list[Document]) -> list[tuple[str, str]]:
+    """找出 expected_sources 里**在语料中已不存在**的标注，返回 [(query_id, 标注), ...]。
+
+    为什么需要这道校验：删文档（如 P3 迁移清理「只有向量、无落盘原件」的孤儿）之后，
+    指向它的标注不会报错、也不会变红 —— 那条 query 只是**永远不可能命中**，
+    静默地把 recall 拉低几个百分点。upload_zh_06 就是这么烂掉的：
+    它的期望件 `可重入锁.md` 被迁移删了（7 段，与「820/21 → 813/20」逐段吻合），
+    但标注还留着，于是 recall 里混进了一条注定 MISS 的样本。
+
+    判定复用 is_hit 的同一套口径（预置件按相对路径、上传件按 `__` 后半段），
+    避免出现第二套标准。
+    """
+    known: set[str] = set()
+    for d in docs:
+        src = d.metadata.get("source") or ""
+        if src:
+            known.add(src)
+            known.add(src.split("__", 1)[-1])   # 上传件：文件名
+            known.add(src.rsplit("/", 1)[-1])   # 预置件：末段（is_hit 的 endswith("/" + exp) 等价形式）
+    return [(q["id"], e) for q in queries for e in q["expected_sources"] if e not in known]
+
+
 def pct(x: float) -> str:
     return f"{x * 100:5.1f}%"
 
@@ -526,6 +548,19 @@ def main() -> int:
     t_corpus = time.perf_counter() - t
     print(f"语料：{stats['chunks']} 段（预置 {stats['preset']} / 上传 {stats['upload']}）"
           f"，共 {stats['chars'] / 1e6:.2f}M 字符，加载 {t_corpus:.2f}s")
+
+    # ---- 标注与语料的一致性校验（用**完整**查询表，不受 --quick 截断影响）----
+    miss = missing_expected(data["queries"], docs)
+    if miss:
+        print()
+        print("=" * 78)
+        print(f"⚠ 标注与语料不一致：{len(miss)} 个 expected_source 在语料里不存在")
+        print("=" * 78)
+        for qid, e in miss:
+            print(f"   · {qid:<16s} → {e}")
+        print("   → 这些 query **永远不可能命中**（不是检索缺陷），会永久拉低 recall/MRR。")
+        print("     处置：要么把文档补回语料（重新上传），要么更新/移除该条标注。")
+        print()
 
     t = time.perf_counter()
     get_bm25(args.k)
