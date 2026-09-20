@@ -263,46 +263,57 @@ def _make_nodes(model, vectorstore):
         # （覆写会让第 2 次拿到第 1 次的输出，关键词越滚越偏）。
         return {"search_query": result.query, "rewrites": attempt}
 
-    def generate(state: RAGState):
-        question = state["question"]
-        history = state.get("messages", [])  # 之前轮次的 Human/AI 消息（首轮为 []）
+    # ── 两条作答路径各自成函数（⑧ 的落地方式，见下方说明）─────────────────
+    # 原先把它们都塞在 `generate` 里、靠 `if not state["documents"]` 分叉。
+    # ⚠ 为什么**不拆成两个 LangGraph 节点**：
+    #   ① `chat_service.py:55` 用 `meta["langgraph_node"] == "generate"` 过滤流式 token，
+    #      拆节点会让兜底路径的 token 被整条丢掉（除非同时改那处过滤）；
+    #   ② 拆分原本的收益是「兜底话术可以单独调」—— 但两份提示词**早已是模块级常量**
+    #      （_GENERATE_RULES / _UNGROUNDED_RULES），这条收益并不存在。
+    #   所以：提成命名函数拿可读性，不付「新增用户可见节点名」的契约代价。
+    def _answer_without_kb(question: str, history: list):
+        """无资料兜底：不硬拒答，真调 model 用自有知识作答，并自我声明未经验证。
 
-        # ── 无文档兜底 ──────────────────────────────────────────────
-        if not state["documents"]:
-            # 不再硬拒答：真调用 model 用自有知识作答。三个好处：
-            # ① 答案有实质内容；② streaming=True 下是真流式，前端逐字看到输出；
-            # ③ grounded=False 写进 additional_kwargs，刷新后从 history 读回来仍能渲染警示标识。
-            prompt = [SystemMessage(content=_UNGROUNDED_RULES), *history,
-                      HumanMessage(content=question)]
-            answer = model.invoke(prompt)
-            return {
-                "generation": answer.content,
-                # add_messages reducer 会把这两条追加到 state["messages"]
-                "messages": [HumanMessage(content=question),
-                             AIMessage(content=answer.content,
-                                       additional_kwargs={"grounded": False})],
-            }
+        三个好处：① 答案有实质内容；② streaming=True 下是真流式，前端逐字看到输出；
+        ③ grounded=False 写进 additional_kwargs，刷新后从 history 读回来仍能渲染警示标识。
+        """
+        prompt = [SystemMessage(content=_UNGROUNDED_RULES), *history,
+                  HumanMessage(content=question)]
+        answer = model.invoke(prompt)
+        return {
+            "generation": answer.content,
+            # add_messages reducer 会把这两条追加到 state["messages"]
+            "messages": [HumanMessage(content=question),
+                         AIMessage(content=answer.content,
+                                   additional_kwargs={"grounded": False})],
+        }
 
-        # ── 正常 RAG 路径 ───────────────────────────────────────────
+    def _answer_from_context(documents: list, question: str, history: list):
+        """正常 RAG 路径：把资料拼成带编号的上下文，要求模型标注出处。"""
         # 资料编号用【资料N】：既能要求模型标注出处（契约里 sources 是有的），
         # 又不会与 grade 提示词的 [N] 编号格式混淆
         context = "\n\n".join(
             f"【资料{i + 1}·{d.metadata.get('title', '片段')}】{d.page_content}"
-            for i, d in enumerate(state["documents"])
+            for i, d in enumerate(documents)
         )
-
         # system 只放稳定规则；资料随本轮问题一起放最后——离问题最近，且 system 跨轮不变
         prompt = [SystemMessage(content=_GENERATE_RULES), *history,
                   HumanMessage(content=f"资料：\n{context}\n\n问题：{question}")]
-
         answer = model.invoke(prompt)  # streaming=True → LangGraph messages-mode 自动逐 token 推送
-
         return {
             "generation": answer.content,
             "messages": [HumanMessage(content=question),
                          AIMessage(content=answer.content,
                                    additional_kwargs={"grounded": True})],
         }
+
+    def generate(state: RAGState):
+        """按「有没有留下资料」分发到两条作答路径。"""
+        question = state["question"]
+        history = state.get("messages", [])  # 之前轮次的 Human/AI 消息（首轮为 []）
+        if not state["documents"]:
+            return _answer_without_kb(question, history)
+        return _answer_from_context(state["documents"], question, history)
 
     return retrieve, grade_documents, rewrite_query, generate
 

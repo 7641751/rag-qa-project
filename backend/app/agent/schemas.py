@@ -1,6 +1,8 @@
 from datetime import UTC, datetime
 from typing import TypedDict, Annotated
 
+from langchain_core.documents import Document
+from langchain_core.messages import BaseMessage
 from langgraph.graph import add_messages
 from pydantic import BaseModel, Field, field_serializer, field_validator
 
@@ -11,12 +13,13 @@ BCRYPT_MAX_BYTES = 72
 class RAGState(TypedDict):
     question: str           # **用户原话，全程不被覆写**（改写只动 search_query）
     search_query: str       # 改写后的检索查询；未发生改写时**该键不存在**
-    documents: list  # 整体覆盖语义：retrieve / grade 每次返回完整新列表
+    documents: list[Document]   # 整体覆盖语义：retrieve / grade 每次返回完整新列表
     retrieved_count: int    # retrieve 的**原始召回条数**。grade 会覆盖 documents，
                             # 覆盖后就无从判断保留率了 —— 而那是 grade_strict 的门槛依据
-    generation: str
+    generation: str         # 与 messages[-1].content 冗余，但**是有意的**：
+                            # chat_service 靠它做「全程没推过 token 却拿到了答案」的补发兜底
     rewrites: int # 已重写次数
-    messages: Annotated[list, add_messages]  # 累积对话历史
+    messages: Annotated[list[BaseMessage], add_messages]  # 累积对话历史
     user_id: int | None    # 由 chat_service 从 token 注入；CLI / 测试可为 None
 
 # ---------- 结构化输出 Schema ----------
