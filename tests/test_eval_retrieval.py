@@ -5,9 +5,13 @@
 删文档（例如 P3 迁移清理「只有向量、无落盘原件」的孤儿）既不报错也不变红，
 那条 query 只是**永远不可能命中**，于是静默把 recall 拉低几个百分点。
 
-upload_zh_06 就是这么烂掉的：期望件 `可重入锁.md` 被迁移删了（7 段，与迁移记录
-「820/21 → 813/20」逐段吻合，备份留在 data/orphan-backup-5230cdcc.json），
-而标注一直留在评估集里 —— 让人误以为「极小文档召回不行」，其实是文档没了。
+upload_zh_06 就是这么烂掉的（2026-09-20 本校验上线当天即抓到）：期望件 `可重入锁.md`
+被 P3 迁移删了（7 段，与迁移记录「820/21 → 813/20」逐段吻合，备份留在
+data/orphan-backup-5230cdcc.json），而标注一直留在评估集里 —— 让人误以为
+「极小文档召回不行」，其实是文档没了。按校验给出的结论，该条已从评估集移除。
+
+注意本文件**不**校验「真实评估集的标注是否都在语料里」—— 那需要向量库，所以由
+eval_retrieval.py 在加载语料后运行时校验（missing_expected）。这里只管数据本身是否规范。
 
 运行：python -m pytest tests/test_eval_retrieval.py
 """
@@ -74,22 +78,41 @@ def test_partial_expected_still_reports_the_missing_one():
     assert got == [("s_03", "langchain/human-in-the-loop.md")]
 
 
-# ============================ 真实回归：upload_zh_06 ============================
-def test_real_eval_set_flags_upload_zh_06():
-    """用真实评估集 + 一份**恰好缺 `可重入锁.md`** 的语料（= 当前线上状态）。
+# ============================ 校验不误伤：真实评估集的上传件标注 ============================
+def test_real_eval_set_upload_annotations_are_not_false_positives():
+    """用真实评估集 + 一份由「标注里的上传件名字」自造出来的语料。
 
-    语料用标注里的上传件名字自造（不含预置件，所以预置标注会全部报缺失 —— 这是
-    合成语料的必然结果，不是误报）。真正要钉的是：**除 upload_zh_06 外，不该有
-    任何上传件标注被报出**，即这个校验不会误伤正常标注。
+    语料不含预置件，所以预置标注会全部报缺失（合成语料的必然结果，不是误报）。
+    真正要钉的是：**所有上传件标注都不该被报出** —— 即这个校验不会误伤正常标注。
+    （upload_zh_06 曾在这一步被报出，正是它该被报出的证明；该条已于 2026-09-20 移除。）
     """
     queries = json.loads(
         (ROOT / "data" / "eval_queries.json").read_text(encoding="utf-8"))["queries"]
 
     upload_names = {e for q in queries for e in q["expected_sources"] if "/" not in e}
     docs = [_doc(f"uploads/fake-{i}__{n}")
-            for i, n in enumerate(sorted(upload_names - {"可重入锁.md"}))]
+            for i, n in enumerate(sorted(upload_names))]
 
     got = missing_expected(queries, docs)
 
-    assert ("upload_zh_06", "可重入锁.md") in got
-    assert [pair for pair in got if "/" not in pair[1]] == [("upload_zh_06", "可重入锁.md")]
+    assert [pair for pair in got if "/" not in pair[1]] == []
+
+
+# ============================ 真实评估集的结构不变式 ============================
+def test_real_eval_set_integrity():
+    """数据本身是否规范（不需要向量库）。
+
+    ⚠ 刻意**不**断言「三类各 8 条」：移除 upload_zh_06 后三类是 8/8/7，
+    而 id 空位是故意保留的（避免历史报表里的 id 指向漂移）。
+    """
+    queries = json.loads(
+        (ROOT / "data" / "eval_queries.json").read_text(encoding="utf-8"))["queries"]
+
+    ids = [q["id"] for q in queries]
+    assert len(ids) == len(set(ids)), "id 必须唯一"
+    assert all(q["expected_sources"] for q in queries), "每条都要有标注"
+    assert {q["type"] for q in queries} == {"term_en", "semantic_zh", "upload_zh"}
+    for q in queries:
+        assert q["id"].startswith(q["type"]), f"{q['id']} 与 type={q['type']} 不一致"
+        for e in q["expected_sources"]:
+            assert e.endswith((".md", ".pdf")), f"{q['id']} 的标注不像是文档标识：{e}"

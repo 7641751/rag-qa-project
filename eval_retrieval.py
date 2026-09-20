@@ -185,7 +185,7 @@ def probe_reranker(top_n: int, timeout: int = RERANK_TIMEOUT_S) -> float:
 
     qwen3.7-text-rerank **不在** SDK 的 TextReRank.Models 常量表里（该表只有
     gte-rerank / gte-rerank-v2 / qwen3-rerank / qwen3-vl-rerank），可用性必须实测；
-    否则 24 条 query 会各自抛错，整轮评估作废且日志冗长。
+    否则每条 query 会各自抛错，整轮评估作废且日志冗长。
     **不做静默降级**：降级会产出一行无意义的 hybrid_rerank 数据，违背本脚本的评估纪律。
     """
     docs = [Document("重置数据库连接池的正确写法"), Document("如何配置反向代理的端口")]
@@ -266,9 +266,9 @@ def missing_expected(queries: list[dict], docs: list[Document]) -> list[tuple[st
 
     为什么需要这道校验：删文档（如 P3 迁移清理「只有向量、无落盘原件」的孤儿）之后，
     指向它的标注不会报错、也不会变红 —— 那条 query 只是**永远不可能命中**，
-    静默地把 recall 拉低几个百分点。upload_zh_06 就是这么烂掉的：
-    它的期望件 `可重入锁.md` 被迁移删了（7 段，与「820/21 → 813/20」逐段吻合），
-    但标注还留着，于是 recall 里混进了一条注定 MISS 的样本。
+    静默地把 recall 拉低几个百分点。upload_zh_06 就是这么烂掉的（本校验上线当天即抓到，
+    该条已按它的结论移除）：期望件 `可重入锁.md` 已被迁移删掉（7 段，与
+    「820/21 → 813/20」逐段吻合），但标注一直留着，于是 recall 里混进一条注定 MISS 的样本。
 
     判定复用 is_hit 的同一套口径（预置件按相对路径、上传件按 `__` 后半段），
     避免出现第二套标准。
@@ -366,7 +366,7 @@ def eval_query(q: str, k: int, top_n: int, weights_list: list[tuple[float, float
     所以累计值就是上线后的真实耗时，不是"只算融合那一下"的自欺数字。
 
     融合是纯 Python 字典累加（微秒级），所以扫多组权重几乎零成本；精排是付费网络调用，
-    因此被隔离到第二轮，只对选定的那组权重跑一次（24 条 = 24 次调用，而非 24×N）。
+    因此被隔离到第二轮，只对选定的那组权重跑一次（N 条 query = N 次调用，而非 N × 权重组数）。
     """
     multi = len(weights_list) > 1
     out: dict[str, dict] = {}
@@ -715,7 +715,7 @@ def main() -> int:
         print("      这正是 hybrid_w1.0 的 MRR 低于 dense 的原因。")
         print("    → ⚠ 但「入库去重 + 滤超短片段」**只对 hybrid 有用**：累加计分是 RRF 的行为，")
         print("      dense 是单路相似度排序、不累加。实测（2026-09-20，语料 3755 段中 311 段 <100")
-        print("      字符、125 段长重复；k=4 与 k=5 各模拟一遍）：垃圾仅占 2/96 席位，滤掉后 24 条")
+        print("      字符、125 段长重复；k=4 与 k=5 各模拟一遍）：垃圾仅占 2/96 席位，滤掉后当轮 24 条")
         print("      查询的 recall/MRR/hit@1 **一个都没变**。→ 不必为此重建向量库（3319 段 = 332 次")
         print("      嵌入请求），等真要上 hybrid 时把这一步并进那次重建即可。")
     print(f"  · 冷启动开销：语料加载 {t_corpus:.1f}s + BM25 建索引 {t_bm25:.1f}s"

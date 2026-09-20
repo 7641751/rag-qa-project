@@ -1,6 +1,9 @@
 {
   "_comment": [
-    "检索离线评估集。24 条查询，三类各 8 条。",
+    "检索离线评估集。23 条查询（term_en 8 / semantic_zh 8 / upload_zh 7）。",
+    "  · 2026-09-20 移除 upload_zh_06：它的期望件 可重入锁.md 已被 P3 迁移清理（「只有向量、",
+    "    无落盘原件」的孤儿，备份见 data/orphan-backup-5230cdcc.json），该条永远不可能命中，",
+    "    留着只会被误读成「极小文档召回不行」。id 空位**故意保留**，避免历史报表里的 id 指向漂移。",
     "标注口径：expected_sources 写文档标识，命中 = top-k 里任一段来自其中之一。",
     "  · 预置件用相对路径（如 langgraph/checkpointers.md），与 Chroma metadata 的 source 字段逐字相等；",
     "  · 上传件用文件名（如 缓存雪崩.md），脚本按 source 的 '__' 后半段精确匹配。",
@@ -83,8 +86,8 @@
       "id": "semantic_zh_03",
       "type": "semantic_zh",
       "query": "怎么在给出答案之前让人工审核一遍",
-      "expected_sources": ["langchain/human-in-the-loop.md", "langgraph/interrupts.md"],
-      "note": "human-in-the-loop 的中文说法；两篇都讲审批中断。【审计确认为真 MISS，标注保留不动】实跑召回的是上传件《第3节. Think In LangGraph.md》里的邮件客服 prompt 与意图识别分支，与「人工审核」无关——这是本评估集里唯一的真失败例，也是最有价值的一条：它说明问题是「查询→语料语义鸿沟」（该由 CRAG 的 rewrite_query 解决），而不是「缺一路稀疏检索」。"
+      "expected_sources": ["langchain/human-in-the-loop.md", "langgraph/interrupts.md", "第3节. Think In LangGraph.md"],
+      "note": "human-in-the-loop 的中文说法；两篇官方文档都讲审批中断。【2026-09-20 复核后放宽，推翻原审计】原审计划为「真 MISS，标注保留不动」，理由是「召回的是邮件客服 prompt 与意图识别分支，与人工审核无关」。逐段读原文后不成立：被召回的 chunk#14 就是 `## 人工确认` 节点，内含 `from langgraph.types import interrupt` 与 `def human_review(state)` —— 与 langgraph/interrupts.md 讲的是同一件事；chunk#11（「紧急任务、复杂任务、账单相关，都走人工审核」）与 chunk#12（needs_review 判定 → goto human_review）也都在讲何时该走人工审核。处置与 semantic_zh_01/02 相同（标注过窄 → 补入上传件）。"
     },
     {
       "id": "semantic_zh_04",
@@ -156,13 +159,6 @@
       "query": "二叉搜索树删除节点分几种情况",
       "expected_sources": ["BST.md"],
       "note": "上传件（47 段），文件名是英文缩写 BST 但内容是中文。查询用中文全称「二叉搜索树」→ 文件名匹配不上，考内容检索。"
-    },
-    {
-      "id": "upload_zh_06",
-      "type": "upload_zh",
-      "query": "可重入锁和非可重入锁的区别",
-      "expected_sources": ["可重入锁.md"],
-      "note": "上传件只有 7 段（最小的之一），检验极小文档的召回。"
     },
     {
       "id": "upload_zh_07",
