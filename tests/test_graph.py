@@ -29,6 +29,7 @@ from langchain_core.language_models.fake_chat_models import FakeMessagesListChat
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.checkpoint.memory import InMemorySaver
+from pydantic import Field
 
 from config import settings
 from backend.app.agent.graph import _decide_to_generate, _make_nodes, build_graph, kb_filter
@@ -213,12 +214,19 @@ def test_node_grade_filters():
 
 
 def test_node_rewrite_updates_state():
-    """rewrite_query：替换 question 并使 rewrites 计数 +1。"""
+    """rewrite_query：产出 search_query 并使 rewrites 计数 +1。
+
+    ⚠ 本用例原先断言 `out["question"] == model.rewrite_to`，即「改写覆写 question」——
+    那等于把 P0-① 的缺陷当成期望行为钉进了测试。改写是**检索**手段，用户原话不该被动：
+    覆写 question 会让历史里的提问变成英文改写查询（刷新后用户可见），
+    还会让第 2 次改写的「原始问题」变成第 1 次的输出。
+    """
     model = _model()
     _, _, rewrite, _ = _make_nodes(model, FakeVectorStore())
     out = rewrite({"question": "原始问题", "documents": [], "generation": "", "rewrites": 0})
 
-    assert out["question"] == model.rewrite_to
+    assert out["search_query"] == model.rewrite_to
+    assert "question" not in out, "改写不得覆写用户原话（P0-①）"
     assert out["rewrites"] == 1
 
 
@@ -297,3 +305,152 @@ def test_kb_filter_never_uses_origin_builtin():
             f"过滤条件里出现了 origin={cond}；预置文档没有 origin 字段，"
             "用它过滤会让 88 篇官方文档全部消失，应该用 kb")
         assert "langchain_docs" in cond
+
+
+# ============================ 6. P0 修复：改写不改用户原话 + 空检索短路 ============================
+class RecordingRAGModel(FakeRAGModel):
+    """在 FakeRAGModel 上记录每次 LLM 调用的提示词，用于断言「哪些节点真的被调用了」。
+
+    ⚠ 不能只断言「没抛异常」来证明「grade 被跳过了」—— 那只说明这次侥幸没炸，
+    数不清调用次数。`seen` 存完整提示词，`kinds()` 按提示词开头分类。
+    """
+
+    seen: list = Field(default_factory=list)
+
+    def _generate(self, messages, *a, **kw):
+        self.seen.append(((messages[-1].content if messages else "") or "").lstrip())
+        return super()._generate(messages, *a, **kw)
+
+    def kinds(self) -> list[str]:
+        def classify(s: str) -> str:
+            if s.startswith("你是检索质量评审员"):
+                return "grade"
+            if s.startswith("你是检索查询改写器"):
+                return "rewrite"
+            return "generate"
+        return [classify(s) for s in self.seen]
+
+
+# ---------- P0-① 改写不得覆写用户原话 ----------
+def test_rewrite_writes_search_query_and_leaves_question_alone(base_state):
+    """★ P0-①：改写结果落到 `search_query`，**不得**再返回 `question`。
+
+    实测过的缺陷：`rewrite_query` 返回 {"question": <英文改写>} 覆写了 state["question"]，
+    而 `generate` 又拿 state["question"] 当本轮 HumanMessage 存进 messages ——
+    于是历史（以及刷新后的气泡）里显示的是 'LangGraph checkpointer 持久化 状态 原理'，
+    而不是用户说的「LangGraph 怎么做持久化？」。
+    额外好处：第 2 次改写时「原始问题」不会再被第 1 次的输出顶掉（关键词漂移叠加）。
+    """
+    _, _, rewrite, _ = _make_nodes(_model(), FakeVectorStore())
+
+    out = rewrite({**base_state, "documents": [], "rewrites": 0})
+
+    assert out["search_query"], "改写结果必须落到 search_query，供 retrieve 使用"
+    assert "question" not in out, "改写不得再碰 question——那是用户的原话"
+
+
+def test_retrieve_searches_with_search_query_when_present(base_state):
+    """retrieve 用改写后的 search_query 检索（向量检索仍享受改写红利）。"""
+    vs = FakeVectorStore()
+    retrieve, _, _, _ = _make_nodes(_model(), vs)
+
+    retrieve({**base_state, "search_query": "LangGraph checkpointer 原理"})
+
+    assert vs.calls[0]["query"] == "LangGraph checkpointer 原理"
+
+
+def test_retrieve_falls_back_to_question_without_search_query(base_state):
+    """未改写（首轮 / CLI）时没有 search_query，检索用用户原话。"""
+    vs = FakeVectorStore()
+    retrieve, _, _, _ = _make_nodes(_model(), vs)
+
+    retrieve(base_state)
+
+    assert vs.calls[0]["query"] == base_state["question"]
+
+
+def test_history_keeps_original_question_after_rewrite(base_state):
+    """★ P0-① 端到端：真发生改写后，messages 里的用户提问仍必须是原话。"""
+    app = build_graph(model=_model(relevance_mode="after_rewrite"),
+                      vectorstore=FakeVectorStore(), checkpointer=InMemorySaver())
+
+    result = app.invoke(base_state, config={"configurable": {"thread_id": "t-orig"},
+                                            "recursion_limit": 20})
+
+    assert result["rewrites"] == 1, "本用例需要真的发生改写，否则测不到这条路径"
+    humans = [m.content for m in result["messages"] if isinstance(m, HumanMessage)]
+    assert humans == [base_state["question"]], f"历史里的用户提问被改写了：{humans}"
+
+
+def test_second_rewrite_still_gets_original_question(base_state):
+    """★ 同源缺陷：连续改写时，「原始问题」不能被上一次的改写结果顶掉。
+
+    旧实现里 rewrite 覆写 question，于是第 2 次改写拿到的是第 1 次的**输出** ——
+    关键词越滚越偏（本例的假模型固定返回同一串，真实模型下这就是质量漂移）。
+    """
+    model = RecordingRAGModel(responses=[], relevance_mode="none")
+    app = build_graph(model=model, vectorstore=FakeVectorStore(),
+                      checkpointer=InMemorySaver())
+    model.seen.clear()
+
+    app.invoke(base_state, config={"configurable": {"thread_id": "t-drift"},
+                                   "recursion_limit": 25})
+
+    prompts = [p for p in model.seen if p.startswith("你是检索查询改写器")]
+    assert len(prompts) == settings.max_rewrites, "应当发生 max_rewrites 次改写"
+    for p in prompts:
+        assert f"原始问题：{base_state['question']}" in p, (
+            "每次改写的「原始问题」都必须是用户原话，而不是上一次的改写结果")
+
+
+# ---------- P0-② 空召回不能走 grade ----------
+def test_retrieve_empty_skips_grade(base_state):
+    """★ P0-②：一次都没召回时**不该调 grade**。
+
+    实测过的缺陷：0 条候选时 grade 的提示词退化成「候选文档共 0 条（编号 1..0）…
+    请按编号顺序输出 0 个布尔值」，`with_structured_output` 拿不到合法 JSON
+    （实测抛 JSONDecodeError）→ 异常冒泡成 SSE error 帧 →
+    **用户拿不到本该有的「未命中知识库」兜底答案**。
+    """
+    model = RecordingRAGModel(responses=[], relevance_mode="all")
+    app = build_graph(model=model, vectorstore=FakeVectorStore(docs=[]),
+                      checkpointer=InMemorySaver())
+    model.seen.clear()
+
+    result = app.invoke(base_state, config={"configurable": {"thread_id": "t-empty"},
+                                            "recursion_limit": 25})
+
+    assert "grade" not in model.kinds(), f"空召回不该调 grade：{model.kinds()}"
+    assert result["documents"] == []
+    assert "模拟回答" in result["generation"], "兜底路径必须真的产出答案，而不是让整轮报错"
+
+
+def test_retrieve_empty_rewrites_then_falls_back(base_state):
+    """空召回 → 直接改写；改写用尽 → 兜底作答。LLM 只花在改写与生成上。"""
+    model = RecordingRAGModel(responses=[], relevance_mode="all")
+    vs = FakeVectorStore(docs=[])
+    app = build_graph(model=model, vectorstore=vs, checkpointer=InMemorySaver())
+    model.seen.clear()
+
+    app.invoke(base_state, config={"configurable": {"thread_id": "t-empty2"},
+                                   "recursion_limit": 25})
+
+    # 首轮 1 次 + 每次改写后各 1 次
+    assert len(vs.calls) == settings.max_rewrites + 1
+    assert sorted(model.kinds()) == ["generate"] + ["rewrite"] * settings.max_rewrites
+
+
+def test_grade_node_with_empty_documents_is_a_noop(base_state):
+    """纵深防御：即便将来拓扑变了把 0 条喂给 grade，它也必须安全返回。
+
+    单靠「retrieve 的条件边不会放空列表进来」是不够的 —— 节点本身必须自保，
+    否则改拓扑的人会重新踩进同一个坑。
+    """
+    model = RecordingRAGModel(responses=[], relevance_mode="all")
+    _, grade, _, _ = _make_nodes(model, FakeVectorStore())
+    model.seen.clear()
+
+    out = grade({**base_state, "documents": []})
+
+    assert out == {"documents": []}
+    assert model.seen == [], "0 条候选时必须短路，不能构造退化提示词去调模型"

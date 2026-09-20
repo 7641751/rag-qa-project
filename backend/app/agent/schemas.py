@@ -9,7 +9,8 @@ from pydantic import BaseModel, Field, field_serializer, field_validator
 BCRYPT_MAX_BYTES = 72
 # ---------- 状态 ----------
 class RAGState(TypedDict):
-    question: str
+    question: str           # **用户原话，全程不被覆写**（改写只动 search_query）
+    search_query: str       # 改写后的检索查询；未发生改写时**该键不存在**
     documents: list  # 整体覆盖语义：retrieve / grade 每次返回完整新列表
     generation: str
     rewrites: int # 已重写次数

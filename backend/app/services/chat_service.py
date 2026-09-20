@@ -46,7 +46,8 @@ async def stream_chat(chat_request: ChatRequest, user_id: int | None = None):
                         detail = f"保留 {len(final_docs)} 段相关"
                     elif node == "rewrite_query":
                         rewrites = delta.get("rewrites", rewrites)
-                        detail = f"重写为: {delta.get('question', '')[:30]}"
+                        # 改写只产出 search_query（不再覆写 question），见 graph.py 的说明
+                        detail = f"重写为: {delta.get('search_query', '')[:30]}"
                     yield sse("step", {"node": node, "label": LABELS.get(node, node), "detail": detail})
             elif mode == "messages":
                 msg, meta = chunk

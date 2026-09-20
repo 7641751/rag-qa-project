@@ -2,15 +2,23 @@
 """rag_qa_project 核心工作流（CRAG 简化版，LangGraph 实现）。
 
 流程：
-    START -> retrieve -> grade_documents -> decide
-        decide: 有相关文档    -> generate -> END
-                无相关且可重写 -> rewrite_query -> retrieve（循环）
-                重写次数用尽   -> generate（无资料：放开自由度，用模型自有知识作答并自我声明）
+    START -> retrieve -> decide_after_retrieve
+        decide_after_retrieve: 有召回          -> grade_documents -> decide_to_generate
+                               无召回且可改写   -> rewrite_query -> retrieve（循环）
+                               无召回且改写用尽 -> generate（兜底）
+    decide_to_generate: 有相关文档    -> generate -> END
+                        无相关且可重写 -> rewrite_query -> retrieve（循环）
+                        重写次数用尽   -> generate（无资料：用模型自有知识作答并自我声明）
 
 设计要点：
 - build_graph(model=None, vectorstore=None, checkpointer=None) 支持依赖注入，
   测试时可传入 FakeChatModel / 内存向量库，零 API 额度跑通全图。
 - 每个节点是纯函数：输入状态 -> 输出增量更新。
+- **改写只产出 `search_query`，绝不覆写 `question`**：前者是检索手段，后者是用户原话。
+  覆写 question 会同时污染两处 —— 历史里记的用户提问变成英文改写查询（刷新后可见），
+  且第 2 次改写的「原始问题」会变成第 1 次的输出（关键词漂移叠加）。
+- **空召回不走 grade**：0 条候选时它的提示词会退化成「编号 1..0 / 输出 0 个布尔值」，
+  结构化输出拿不到合法 JSON，整轮以报错结束，用户反而拿不到兜底答案。
 """
 from functools import lru_cache
 
@@ -149,23 +157,37 @@ def _make_nodes(model, vectorstore):
     """闭包工厂：把 model / vectorstore 注入节点函数。"""
 
     def retrieve(state: RAGState):
-        docs = vectorstore.similarity_search(state["question"], k=settings.top_k,
+        # 有改写就用改写后的查询（向量检索享受改写红利），否则用用户原话。
+        query = state.get("search_query") or state["question"]
+        docs = vectorstore.similarity_search(query, k=settings.top_k,
                                              filter=kb_filter(state.get("user_id")))
         print(f"    [retrieve] 命中 {len(docs)} 段: "
               f"{[d.metadata.get('title', '?') for d in docs]}")
         return {"documents": docs}
 
     def grade_documents(state: RAGState):
-        grader = model.with_structured_output(GradeDocuments)
         docs = state["documents"]
+        # 0 条候选直接短路，**不去构造那份退化提示词**：向模型要「0 个布尔值」时
+        # 结构化输出不可靠（实测会拿到非 JSON → JSONDecodeError → 异常冒泡成 SSE
+        # error），结果反而是用户拿不到本该有的「未命中知识库」兜底答案。
+        # 条件边已保证正常路径不会走到这里；节点自保一层，免得日后改拓扑的人重踩。
+        if not docs:
+            return {"documents": []}
+
+        grader = model.with_structured_output(GradeDocuments)
         n = len(docs)
         preview = settings.grade_preview_chars
         # 编号从 1 开始（对模型比 0-based 友好）；过滤靠 zip 的位置对应，与编号基准无关
         numbered = "\n".join(
             f"[{i + 1}] {d.page_content[:preview]}" for i, d in enumerate(docs))
+        # 判据用**用户原话**（该不该留下，最终由用户的需求决定）；发生过改写时把
+        # 检索查询一并给出，让判官知道「这些片段是凭什么被召回的」。
+        search = state.get("search_query")
+        query_block = (f"问题：{state['question']}\n检索查询：{search}"
+                       if search else f"问题：{state['question']}")
         result = grader.invoke(
             f"你是检索质量评审员。知识库是 LangChain / LangGraph 的英文官方文档和上传的文档。\n\n"
-            f"问题：{state['question']}\n\n"
+            f"{query_block}\n\n"
             f"候选文档共 {n} 条（编号 1..{n}，每条已截断到前 {preview} 字符）：\n"
             f"{numbered}\n\n"
             f"判定标准（宁可多留、不可误删）：\n"
@@ -199,7 +221,11 @@ def _make_nodes(model, vectorstore):
             f"这是第 {attempt} 次改写（最多 {settings.max_rewrites} 次），"
             f"请比上一次更宽泛、更关键词化。")
         print(f"    [rewrite] 第 {attempt} 次重写: {result.query}")
-        return {"question": result.query, "rewrites": attempt}
+        # ⚠ 只写 search_query，**不碰 question**。question 是用户原话，它有两个下游
+        # 用途：① generate 拿它作为本轮 HumanMessage 存进 messages（覆写会让历史里
+        # 的提问变成英文改写查询，刷新后用户可见）；② 本函数下一次改写的「原始问题」
+        # （覆写会让第 2 次拿到第 1 次的输出，关键词越滚越偏）。
+        return {"search_query": result.query, "rewrites": attempt}
 
     def generate(state: RAGState):
         question = state["question"]
@@ -246,6 +272,19 @@ def _make_nodes(model, vectorstore):
 
 
 # ---------- 路由 ----------
+def _decide_after_retrieve(state: RAGState):
+    """retrieve 之后的分流：有召回才值得花一次 LLM 去评；一条都没召回就直接改写。
+
+    这省下的不只是一次调用（有改写时最多省 max_rewrites 次）：0 条候选时 grade 会
+    构造一份退化提示词（「候选文档共 0 条（编号 1..0）…请输出 0 个布尔值」），
+    with_structured_output 拿不到合法 JSON，整轮以 SSE error 结束 ——
+    **用户于是拿不到本该有的「未命中知识库」兜底答案**。
+    """
+    if state["documents"]:
+        return "grade_documents"
+    return "rewrite_query" if state["rewrites"] < settings.max_rewrites else "generate"
+
+
 def _decide_to_generate(state: RAGState):
     if state["documents"]:
         return "generate"
@@ -268,7 +307,13 @@ def build_graph(model=None, vectorstore=None, checkpointer=None):
     b.add_node("rewrite_query", rewrite)
     b.add_node("generate", generate)
     b.add_edge(START, "retrieve")
-    b.add_edge("retrieve", "grade_documents")
+    # retrieve 之后不是无条件进 grade：空召回直接改写，省掉一次注定失败的 LLM 调用
+    b.add_conditional_edges(
+        "retrieve", _decide_after_retrieve,
+        {"grade_documents": "grade_documents",
+         "rewrite_query": "rewrite_query",
+         "generate": "generate"},
+    )
     b.add_conditional_edges(
         "grade_documents", _decide_to_generate,
         {"generate": "generate", "rewrite": "rewrite_query"},

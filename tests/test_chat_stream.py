@@ -53,9 +53,12 @@ def _parse_sse(frames: list[str]) -> list[tuple[str, dict]]:
 
 def _run_stream_with_vs(monkeypatch, relevance_mode: str,
                         question: str = "LangGraph 怎么做持久化？",
-                        user_id: int | None = None):
-    """同 _run_stream，但把**向量库替身也返回** —— 否则断言不了检索收到的 filter。"""
-    vs = FakeVectorStore()
+                        user_id: int | None = None, docs=None):
+    """同 _run_stream，但把**向量库替身也返回** —— 否则断言不了检索收到的 filter。
+
+    `docs=[]` 用于构造「知识库为空」场景（新环境还没跑 ingest.py）。
+    """
+    vs = FakeVectorStore(docs=docs) if docs is not None else FakeVectorStore()
     app = build_graph(model=FakeRAGModel(responses=[], relevance_mode=relevance_mode),
                       vectorstore=vs, checkpointer=InMemorySaver())
     monkeypatch.setattr(chat_service, "get_graph", lambda: app)
@@ -162,6 +165,28 @@ def test_stream_injects_user_id_into_retrieval_filter(monkeypatch):
 
     assert vs.calls[0]["filter"] == {"$or": [{"kb": "langchain_docs"}, {"user_id": 7}]}
     assert [e for e, _ in frames][-1] == "done"      # 注入 user_id 不影响事件序
+
+
+def test_empty_kb_emits_fallback_not_error(monkeypatch):
+    """★ P0-②（端点层）：知识库为空时，用户该看到兜底答案，而不是 error 帧。
+
+    这是**用户可见的那一层**：0 条候选时 grade 会构造退化提示词（「编号 1..0 /
+    输出 0 个布尔值」）→ `with_structured_output` 拿不到合法 JSON → 异常冒泡到
+    `stream_chat` 的 except → 前端只收到一个 error，**本该有的兜底答案没了**。
+
+    触发条件很窄但很真实：实测（真实 Chroma + 真实 LLM）KB 非空时永远召回 4 段
+    （similarity_search 无阈值），所以只有「还没跑 ingest.py 的新环境」会走到这里
+    —— 而那正是新用户第一次打开页面的场景。
+    """
+    frames, vs = _run_stream_with_vs(monkeypatch, relevance_mode="all", docs=[])
+    events = [e for e, _ in frames]
+
+    errors = [d for e, d in frames if e == "error"]
+    assert not errors, f"空知识库不该报错，而应走兜底：{errors}"
+    assert events[-1] == "done"
+    assert [d["text"] for e, d in frames if e == "token"], "兜底路径也必须产出答案"
+    assert [d for e, d in frames if e == "done"][0]["grounded"] is False
+    assert vs.calls, "仍然应该先尝试检索一次"
 
 
 def test_stream_without_user_id_sees_only_builtin(monkeypatch):
