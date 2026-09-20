@@ -677,7 +677,12 @@ def main() -> int:
         print(f"  · ⚠ dense 结果含重复内容的 query：{len(dup_rows)}/{len(rows)}"
               f"（如 {dup_rows[0]}）")
         print("    → RRF 对重复内容**累加计分**（官方 EnsembleRetriever 行为），重复 chunk 排名虚高，")
-        print("      这正是 hybrid_w1.0 的 MRR 低于 dense 的原因；建议入库时对 chunk 去重、过滤超短片段。")
+        print("      这正是 hybrid_w1.0 的 MRR 低于 dense 的原因。")
+        print("    → ⚠ 但「入库去重 + 滤超短片段」**只对 hybrid 有用**：累加计分是 RRF 的行为，")
+        print("      dense 是单路相似度排序、不累加。实测（2026-09-20，语料 3755 段中 311 段 <100")
+        print("      字符、125 段长重复；k=4 与 k=5 各模拟一遍）：垃圾仅占 2/96 席位，滤掉后 24 条")
+        print("      查询的 recall/MRR/hit@1 **一个都没变**。→ 不必为此重建向量库（3319 段 = 332 次")
+        print("      嵌入请求），等真要上 hybrid 时把这一步并进那次重建即可。")
     print(f"  · 冷启动开销：语料加载 {t_corpus:.1f}s + BM25 建索引 {t_bm25:.1f}s"
           + (f" + 精排探活 {t_probe:.1f}s" if use_rerank else ""))
     print("    → BM25 索引是静态快照，**KB 上传后必须 cache_clear() 重建**，"
