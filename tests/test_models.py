@@ -34,7 +34,7 @@ from sqlalchemy.schema import CreateTable
 # 让 tests/ 能导入项目模块（等价于把 rag_qa_project 标记为 Sources Root）
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from backend.app.models import Base, Conversation, User
+from backend.app.models import Base, Conversation, QaEvent, User
 
 # 一个合法的 bcrypt 形状（$2b$ + 12 轮 + 22 盐 + 31 哈希 = 60 字符），避免在用例里真算哈希
 _FAKE_HASH = "$2b$12$" + "x" * 53
@@ -186,3 +186,35 @@ def test_both_tables_share_innodb_and_utf8mb4_collation():
         assert "ENGINE=InnoDB" in ddl, f"{table.name} 缺 ENGINE=InnoDB"
         assert "utf8mb4_0900_ai_ci" in ddl, f"{table.name} 缺 utf8mb4_0900_ai_ci"
         assert "utf8mb4" in ddl, f"{table.name} 缺 charset"
+
+
+# ============================ 5. qa_events 对齐 §10 ============================
+def test_qa_events_columns_match_spec_section_10():
+    """★ §10 的 CREATE TABLE qa_events：八个字段一个都不能少。"""
+    cols = {c.name for c in QaEvent.__table__.columns}
+
+    assert {"id", "event_id", "user_id", "thread_id",
+            "rewrites", "grounded", "latency_ms", "created_at"} <= cols
+
+
+def test_qa_events_event_id_has_unique_constraint():
+    """★ event_id 必须有 UNIQUE 约束 —— 这是这张表存在的理由。
+
+    Redis Streams 是**至少一次**投递：同一事件可能被重复消费。唯一的幂等闸门就是
+    这个唯一键（消费端撞约束后当成功处理）。去掉它，统计会重复计数且无从发现。
+    """
+    uniques = [c for c in QaEvent.__table__.constraints
+               if c.__class__.__name__ == "UniqueConstraint"]
+
+    assert any([col.name for col in u.columns] == ["event_id"] for u in uniques), \
+        "event_id 必须有 UNIQUE 约束（幂等键）"
+
+
+def test_qa_events_has_no_foreign_key_to_users():
+    """★ 刻意不建外键：派生数据不该因为用户被删而级联消失（统计要能独立留存），
+    也避免 CASCADE 在删用户时把事件一并抹掉。
+
+    回归线：将来若有人「顺手」给 user_id 补 ForeignKey，这条用例会红。
+    """
+    assert list(QaEvent.__table__.foreign_keys) == [], \
+        "qa_events 不应有任何外键（尤其不能指向 users.id）"
