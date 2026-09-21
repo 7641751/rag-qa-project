@@ -13,7 +13,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config import Settings
 
-# 会影响本模块断言的环境变量：三个 RAGQA_ 前缀的覆盖项，以及 redis_url 的两个别名
+# 会影响本模块断言的环境变量：三个 RAGQA_ 前缀的覆盖项，以及 redis_url 的两个别名。
+# ⚠ **给下面任一个字段新增/修改 validation_alias 时，必须同步把新名字加进本清单** ——
+#   漏了不会立刻报错，而是以「别人机器上偶发变红」的形式复发（config.py 的 Redis 段
+#   记录了 alias 与 env_prefix 的坑）。
 _ENV_KEYS = ("RAGQA_REDIS_CACHE_ENABLED", "RAGQA_CONV_CACHE_TTL",
              "RAGQA_QA_STREAM_KEY", "RAGQA_REDIS_URL", "REDIS_URL")
 
@@ -31,6 +34,10 @@ def _clean_env(monkeypatch):
     """
     for k in _ENV_KEYS:
         monkeypatch.delenv(k, raising=False)
+    # 反向的一步：`RAGQA_JWT_SECRET` 是**必填**（config.py 的校验器），一旦有人把 .env 里
+    # 的值也清掉，下面每次 Settings(...) 都会抛 ValidationError。显式补一个合法值，
+    # 让本模块在「没有 .env 的 CI」上也能独立跑起来（monkeypatch 结束后自动还原）。
+    monkeypatch.setenv("RAGQA_JWT_SECRET", "0" * 64)
 
 
 def test_defaults_favour_safety(monkeypatch):
@@ -49,9 +56,11 @@ def test_defaults_favour_safety(monkeypatch):
 
 
 def test_missing_redis_url_does_not_block_construction(monkeypatch):
-    """★ Redis 是可选依赖：没配连接串也必须能构造配置。
+    """没配连接串时，`Settings` 仍能构造且 `redis_url` 为空串（回归锁）。
 
-    这是本期「Redis 不可用就降级」承诺的地基，所以值得一条断言，而不是靠「有默认值」推理。
+    ⚠ 这条**只**钉住「无 URL 时不抛异常 + 取到空串」，**不**等于钉住了「Redis 不可用就降级」——
+    那个行为发生在运行期，由 `get_optional_redis` 返回 None 来体现，用例在 Task 3 里
+    （别把这条当成降级承诺的证明）。
     """
     _clean_env(monkeypatch)
 
