@@ -169,7 +169,16 @@ def test_decode_token_rejects_tampered_signature(jwt_secret):
     """★ spec §7.7 第 13 步：手改 token 一个字符 → 401 UNAUTHORIZED。"""
     token = sec.create_access_token(1, "hao")
     head, payload, sig = token.split(".")
-    tampered = f"{head}.{payload}.{'A' if sig[-1] != 'A' else 'B'}{sig[1:]}"
+
+    # ⚠ 翻转的位置必须与取判据的位置**一致**。原写法判据读 `sig[-1]`、却替换 `sig[0]`，
+    #   于是当 `sig[-1] != 'A'` 且 `sig[0] == 'A'` 时 tampered 与原 token **完全相同** ——
+    #   压根没篡改，自然也不会 401。实测触发率 1.38%（5000 个样本 69 次），
+    #   表现为「这条用例偶发红灯」，曾让人怀疑签名实现而不是用例本身。
+    #   末尾的断言让用例自证有效：构造没篡改成功就立刻炸，而不是悄悄变成一条假绿。
+    pos = 0 if sig[0] != "A" else 1
+    tampered = (f"{head}.{payload}.{sig[:pos]}"
+                f"{'A' if sig[pos] != 'A' else 'B'}{sig[pos + 1:]}")
+    assert tampered != token, "构造失败：篡改后的串与原串相同，这条用例已失去意义"
 
     with pytest.raises(HTTPException) as ei:
         sec.decode_token(tampered)

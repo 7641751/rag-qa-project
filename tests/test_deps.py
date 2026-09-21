@@ -60,7 +60,14 @@ def test_wrong_scheme_gives_401(client):
 def test_tampered_token_gives_401(client):
     token = sec.create_access_token(1, "hao")
     head, payload, sig = token.split(".")
-    bad = f"{head}.{payload}.{'A' if sig[-1] != 'A' else 'B'}{sig[1:]}"
+
+    # ⚠ 与 test_security.py 里同一处 flaky 修正（两处曾各有一份）：判据读 `sig[-1]`、
+    #   却替换 `sig[0]` → 当 `sig[-1] != 'A'` 且 `sig[0] == 'A'` 时 bad 与原 token 相同，
+    #   压根没篡改 → 实测 1.38% 概率返回 200 而不是 401。
+    pos = 0 if sig[0] != "A" else 1
+    bad = (f"{head}.{payload}.{sig[:pos]}"
+           f"{'A' if sig[pos] != 'A' else 'B'}{sig[pos + 1:]}")
+    assert bad != token, "构造失败：篡改后的串与原串相同，这条用例已失去意义"
 
     r = client.get("/probe", headers={"Authorization": f"Bearer {bad}"})
 
