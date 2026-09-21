@@ -100,6 +100,13 @@ class Settings(BaseSettings):
     #   顺序即优先级：项目前缀写法 > 裸名。
     redis_url: str = Field("", validation_alias=AliasChoices("RAGQA_REDIS_URL", "REDIS_URL"))
 
+    # ---- Redis 读缓存（P4）----
+    # ⚠ 三个都必须有默认值：Redis 是**可选依赖**，缺它不该拦启动（与 mysql_database_url
+    #   的「空串即快速失败」不同 —— 那条是必需依赖，这条不是）。
+    redis_cache_enabled: bool = True   # 一键回退到「无缓存」行为（RAGQA_REDIS_CACHE_ENABLED）
+    conv_cache_ttl: int = 60           # 列表缓存 TTL 秒；只作兜底（主策略是写时删键）
+    qa_stream_key: str = "ragqa:stream:qa_stats"   # 问答统计事件流
+
     # ---- 鉴权 ----
     jwt_secret: str = ""  # 必填；为空则启动即失败（见下）
     jwt_algorithm: str = "HS256"
