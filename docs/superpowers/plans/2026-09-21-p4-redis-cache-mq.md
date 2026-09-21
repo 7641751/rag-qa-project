@@ -76,26 +76,55 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config import Settings
 
+_ENV_KEYS = ("RAGQA_REDIS_CACHE_ENABLED", "RAGQA_CONV_CACHE_TTL",
+             "RAGQA_QA_STREAM_KEY", "RAGQA_REDIS_URL", "REDIS_URL")
 
-def test_defaults_favour_safety():
-    """默认必须「开缓存 + 60s + 有流键」，且 TTL 是正数（0 会让 SETEX 直接报错）。"""
+
+def _clean_env(monkeypatch):
+    """清掉影响本模块的环境变量。
+
+    ⚠ `Settings(_env_file=None)` **不能**隔离环境：config.py import 期就 load_dotenv()
+    写进了 os.environ，而 pydantic-settings 仍会读 os.environ。不清的话，操作者一设
+    `RAGQA_CONV_CACHE_TTL=300`（本功能的正常用法）「默认值」用例就变红 —— 与
+    tests/test_mysql_db.py 记下的约定冲突。
+    """
+    for k in _ENV_KEYS:
+        monkeypatch.delenv(k, raising=False)
+
+
+def test_defaults_favour_safety(monkeypatch):
+    """默认必须「开缓存 + 60s + 有流键」。只钉默认值，不声称钉住 TTL 为正（那需要字段校验器，
+    而本 task 刻意不给可选依赖加启动期校验）。"""
+    _clean_env(monkeypatch)
+
     s = Settings(_env_file=None)
 
     assert s.redis_cache_enabled is True
     assert s.conv_cache_ttl == 60
-    assert s.conv_cache_ttl > 0
     assert s.qa_stream_key == "ragqa:stream:qa_stats"
 
 
+def test_missing_redis_url_does_not_block_construction(monkeypatch):
+    """★ Redis 是可选依赖：没配连接串也必须能构造配置（「不可用就降级」承诺的地基）。"""
+    _clean_env(monkeypatch)
+
+    s = Settings(_env_file=None)
+
+    assert s.redis_url == ""
+
+
 def test_env_can_override(monkeypatch):
-    """回滚开关与 TTL 都要能通过环境变量改（RAGQA_ 前缀，与既有配置一致）。"""
+    """回滚开关、TTL、流键都要能通过环境变量改（RAGQA_ 前缀，与既有配置一致）。"""
+    _clean_env(monkeypatch)
     monkeypatch.setenv("RAGQA_REDIS_CACHE_ENABLED", "false")
     monkeypatch.setenv("RAGQA_CONV_CACHE_TTL", "5")
+    monkeypatch.setenv("RAGQA_QA_STREAM_KEY", "ragqa:test:stream")
 
     s = Settings(_env_file=None)
 
     assert s.redis_cache_enabled is False
     assert s.conv_cache_ttl == 5
+    assert s.qa_stream_key == "ragqa:test:stream"
 ```
 
 **Step 2：跑测试确认失败**
