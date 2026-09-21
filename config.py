@@ -90,8 +90,8 @@ class Settings(BaseSettings):
     sql_echo: bool = False
 
     # ---- Redis ----
-    # 目前没有生产代码用到它，先把连接串收进配置中心：tests/test_redis.py 的连通性自检要读它，
-    # 将来做会话列表缓存/限流也从这里取（不必再去 .env 里找一遍）。
+    # P4 起：会话列表读缓存用它（backend/tools/redis_cache_tools.py + api/deps.py 的
+    # get_optional_redis），tests/test_redis.py 的连通性自检也读它。
     # ⚠ 用 validation_alias 而不是只靠 env_prefix，是因为两种写法都要认：
     #   · .env 里现用的是 12-factor 约定的裸 `REDIS_URL`（docker-compose / PaaS 也注入这个名字）；
     #   · 项目约定是 `RAGQA_` 前缀。

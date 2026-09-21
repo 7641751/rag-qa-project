@@ -411,12 +411,20 @@ async def invalidate(redis, key: str) -> None:
 **Step 4：跑测试确认通过**
 
 Run: `<python.exe> -m pytest tests/test_redis_cache_tools.py -q --no-header`
-Expected: `9 passed`
+Expected: `14 passed`
 
-> 实现时在原稿 7 条之外补了 2 条（共 9 条）：
+> 实现时在原稿 7 条之外补了 7 条（共 14 条）。前 2 条是实现时主动补的：
 > `test_hit_does_not_refresh_ttl`（命中不续期，防热点键永不过期导致数据长期不收敛）与
-> `test_invalidate_deletes_key_and_is_noop_without_redis`（给 `invalidate` 直接覆盖 ——
-> 原稿只靠 Task 4 的用例间接碰到它）。
+> `test_invalidate_deletes_key_and_is_noop_without_redis`（给 `invalidate` 直接覆盖）。
+>
+> 后 5 条是**质量审查用变异测试**逼出来的 —— 它逐条改实现再跑既有用例，证明有两类契约
+> **没有任何测试守着**（删掉宽兜底分支、甚至让缓存层吞掉 loader 的业务异常，套件依然全绿）：
+> `test_non_redis_exception_also_degrades`（非 RedisError 也要降级且记 error）、
+> `test_loader_business_error_propagates`（★ 反向契约：业务异常必须原样上抛，否则 MySQL 故障
+> 会被伪装成「降级成功」）、`test_unserializable_value_is_dropped_without_raising`
+> （序列化失败要记 error 且不调 set）、`test_corrupt_value_delete_failure_still_misses`、
+> `test_invalidate_failure_does_not_raise`。同时给 `FakeRedis` 加了 `delete_exc`、
+> 给 miss 用例加了「写回去的必须是 JSON 文本」的断言。
 
 **Step 5：提交**
 
@@ -682,9 +690,8 @@ async def list_chat_threads(user_id: int, db: AsyncSession, redis=None) -> Threa
     key = conv_list_key(user_id)
     payload = await cached_json(redis, key, settings.conv_cache_ttl, _load)
 
-    # 自校验：缓存的归属与请求不符 → 当 miss 并清掉坏键（防御性，正常不该发生）
-    if not isinstance(payload, dict) or payload.get("user_id") != user_id \
-            or not isinstance(payload.get("threads"), list):
+    # 自校验：归属不符 / 结构不符 / 单个元素字段不全 → 一律当 miss 并清掉坏键
+    if not _is_valid_payload(payload, user_id):
         logger.error("[cache] 载荷归属或结构异常，丢弃 key=%s", key)
         await invalidate(redis, key)
         payload = await _load()
@@ -692,6 +699,30 @@ async def list_chat_threads(user_id: int, db: AsyncSession, redis=None) -> Threa
     return ThreadListResponse(
         threads=[ConversationSummary(**t) for t in payload["threads"]],
         total=payload["total"])
+
+
+_REQUIRED_THREAD_FIELDS = ("thread_id", "title", "created_at", "updated_at")
+
+
+def _is_valid_payload(payload, user_id: int) -> bool:
+    """缓存载荷自校验：归属正确 + `total` 是整数 + `threads` 每项四个必填字段齐全。
+
+    ⚠ **元素级校验不能省**（质量审查发现）：`{"threads":[{}]}` 能通过「是 list」这一层，
+    但会让 `ConversationSummary(**t)` 抛 `TypeError` → 500 —— 那恰好违反本期的核心承诺
+    「缓存故障不得升级为业务故障」。写成纯函数是为了能单测它。
+
+    `total` 单独校验的原因同 P3：它是前端「仅显示最近 50 条」的唯一依据，缺失或非整数时
+    前端会把「被截断」当成「一共就这么多」。
+    """
+    if not isinstance(payload, dict) or payload.get("user_id") != user_id:
+        return False
+    if not isinstance(payload.get("total"), int):
+        return False
+    threads = payload.get("threads")
+    if not isinstance(threads, list):
+        return False
+    return all(isinstance(t, dict) and all(f in t for f in _REQUIRED_THREAD_FIELDS)
+               for t in threads)
 ```
 
 `chat_service.py` 顶部补：
