@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
-"""ORM 模型（backend/app/models.py）与 P2 spec §5 表结构的对照测试（零数据库依赖）。
+"""ORM 模型（backend/app/models.py）与设计文档表结构的对照测试（零数据库依赖）。
+
+覆盖面：P2 的 `users` / P3 的 `conversations`（§5）+ P4 的 `qa_events`（§10）。
 
 设计思想
 --------
@@ -25,7 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import UniqueConstraint, create_engine, select
 from sqlalchemy.dialects import mysql
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -179,9 +181,14 @@ def test_conversations_user_updated_index_is_declared():
         "第二列必须带 DESC（P3 是按 updated_at 倒序取最近 50 条）"
 
 
-def test_both_tables_share_innodb_and_utf8mb4_collation():
-    """两张表都要 InnoDB + utf8mb4_0900_ai_ci：排序规则不一致会让连接与比较行为漂移。"""
-    for table in (User.__table__, Conversation.__table__):
+def test_all_tables_share_innodb_and_utf8mb4_collation():
+    """**每张表**都要 InnoDB + utf8mb4_0900_ai_ci：排序规则不一致会让连接与比较行为漂移。
+
+    ⚠ 新增表时必须把它加进下面这个元组。这条用例曾叫 `test_both_tables_...` 且只遍历
+    `User`/`Conversation` —— qa_events 落地时没被纳入，于是评审用变异证明：**改掉新表的
+    charset/引擎，全套件依然全绿**。所以名字也一并改成 all_tables，让"漏加一张表"可被察觉。
+    """
+    for table in (User.__table__, Conversation.__table__, QaEvent.__table__):
         ddl = _mysql_ddl(table)
         assert "ENGINE=InnoDB" in ddl, f"{table.name} 缺 ENGINE=InnoDB"
         assert "utf8mb4_0900_ai_ci" in ddl, f"{table.name} 缺 utf8mb4_0900_ai_ci"
@@ -190,11 +197,33 @@ def test_both_tables_share_innodb_and_utf8mb4_collation():
 
 # ============================ 5. qa_events 对齐 §10 ============================
 def test_qa_events_columns_match_spec_section_10():
-    """★ §10 的 CREATE TABLE qa_events：八个字段一个都不能少。"""
-    cols = {c.name for c in QaEvent.__table__.columns}
+    """★ §10 的 CREATE TABLE qa_events：八个字段一个都不能少，**且逐列类型/长度/可空性一致**。
 
-    assert {"id", "event_id", "user_id", "thread_id",
-            "rewrites", "grounded", "latency_ms", "created_at"} <= cols
+    只比列名集合是不够的 —— 评审用变异证明过：把 `event_id` 改成 `VARCHAR(255)`、`grounded`
+    改成字符串、或直接多加一列，集合断言照样全绿。所以这里改成断言 SQLAlchemy **实际编译出的
+    DDL 片段**，与文件既有的 `test_password_hash_width_is_exactly_bcrypt_output_length`
+    同一做法：把「只能靠手工 SHOW CREATE TABLE 看」的事实固化成回归线。
+    """
+    ddl = _mysql_ddl(QaEvent.__table__)
+
+    assert set(QaEvent.__table__.columns.keys()) == {
+        "id", "event_id", "user_id", "thread_id",
+        "rewrites", "grounded", "latency_ms", "created_at"}, \
+        "列集合必须与 §10 完全一致（多一列或漏一列都要发现）"
+
+    for fragment in (
+        "id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT",
+        "event_id VARCHAR(36) NOT NULL",
+        "user_id BIGINT UNSIGNED NOT NULL",
+        "thread_id VARCHAR(36) NOT NULL",
+        "rewrites INTEGER NOT NULL",
+        "grounded BOOL NOT NULL",
+        "latency_ms INTEGER NOT NULL",
+        "created_at DATETIME(6) NOT NULL",
+        "PRIMARY KEY (id)",
+        "CONSTRAINT uq_qa_events_event_id UNIQUE (event_id)",
+    ):
+        assert fragment in ddl, f"§10 要求 DDL 含「{fragment}」，实际：\n{ddl}"
 
 
 def test_qa_events_event_id_has_unique_constraint():
@@ -204,7 +233,7 @@ def test_qa_events_event_id_has_unique_constraint():
     这个唯一键（消费端撞约束后当成功处理）。去掉它，统计会重复计数且无从发现。
     """
     uniques = [c for c in QaEvent.__table__.constraints
-               if c.__class__.__name__ == "UniqueConstraint"]
+               if isinstance(c, UniqueConstraint)]
 
     assert any([col.name for col in u.columns] == ["event_id"] for u in uniques), \
         "event_id 必须有 UNIQUE 约束（幂等键）"
