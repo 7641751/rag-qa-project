@@ -167,10 +167,15 @@ def test_payload_user_mismatch_is_rejected(maker):
 
 def test_structurally_incomplete_payload_falls_back_to_mysql(maker):
     """★ 元素级校验的必要性：`{"user_id":1,"total":1,"threads":[{}]}` 是**合法 JSON、
-    归属也对**，但会被 `ConversationSummary(**)` 抛 TypeError → 500。
+    归属也对**，只有元素缺字段 —— 若放行，它会直捣 `ConversationSummary(**)`。
 
     这正是「缓存故障升级成业务故障」的最短路径，所以必须当 miss 而不是相信它：
     ① 不抛异常 ② 回源拿到正确数据 ③ 删掉这个坏键。
+
+    ⚠ 更正：这条被**第一层**（`_is_valid_payload` 的元素级检查）拦下，**根本到不了 pydantic**；
+    真正会抵达 pydantic 并抛异常的是「字段齐全但类型不符」那类 —— 见下面
+    `test_payload_with_unparseable_timestamp_falls_back_to_mysql`（实测抛的是
+    `ValidationError` 而非 `TypeError`）。
     """
     _seed(maker)
     redis = FakeRedis()
@@ -291,7 +296,11 @@ def test_required_fields_match_schema():
     这条断言把「同步」从口头约定变成会红的测试。
     """
     from backend.app.agent.schemas import ConversationSummary
-    assert set(chat_service._REQUIRED_THREAD_FIELDS) == set(ConversationSummary.model_fields)
+    # ⚠ 只比对**必填**字段：`model_fields` 含带默认值的可选字段。若拿全部字段比对，
+    # 将来给 schema 加一个 `extra: X | None = None` 时这条会红，并把开发者推去把 optional
+    # 塞进「必填清单」—— 那会让第一层校验拒绝**所有**合法载荷，缓存直接形同虚设。
+    required = {name for name, f in ConversationSummary.model_fields.items() if f.is_required()}
+    assert set(chat_service._REQUIRED_THREAD_FIELDS) == required
 
 
 # ============================ 4. 降级 ============================
