@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from pydantic import model_validator
+from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -88,6 +88,17 @@ class Settings(BaseSettings):
     # ---- 数据库 ----
     mysql_database_url: str = ""  # 由 .env 的 RAGQA_MYSQL_DATABASE_URL 注入
     sql_echo: bool = False
+
+    # ---- Redis ----
+    # 目前没有生产代码用到它，先把连接串收进配置中心：tests/test_redis.py 的连通性自检要读它，
+    # 将来做会话列表缓存/限流也从这里取（不必再去 .env 里找一遍）。
+    # ⚠ 用 validation_alias 而不是只靠 env_prefix，是因为两种写法都要认：
+    #   · .env 里现用的是 12-factor 约定的裸 `REDIS_URL`（docker-compose / PaaS 也注入这个名字）；
+    #   · 项目约定是 `RAGQA_` 前缀。
+    #   带前缀的那个必须**显式列出来**：一旦设置 validation_alias，pydantic-settings 就
+    #   不再自动补 env_prefix，只写 "REDIS_URL" 会让 RAGQA_REDIS_URL 静默失效。
+    #   顺序即优先级：项目前缀写法 > 裸名。
+    redis_url: str = Field("", validation_alias=AliasChoices("RAGQA_REDIS_URL", "REDIS_URL"))
 
     # ---- 鉴权 ----
     jwt_secret: str = ""  # 必填；为空则启动即失败（见下）
