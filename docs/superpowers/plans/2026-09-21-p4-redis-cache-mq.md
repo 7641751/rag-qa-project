@@ -411,7 +411,12 @@ async def invalidate(redis, key: str) -> None:
 **Step 4：跑测试确认通过**
 
 Run: `<python.exe> -m pytest tests/test_redis_cache_tools.py -q --no-header`
-Expected: `8 passed`
+Expected: `9 passed`
+
+> 实现时在原稿 7 条之外补了 2 条（共 9 条）：
+> `test_hit_does_not_refresh_ttl`（命中不续期，防热点键永不过期导致数据长期不收敛）与
+> `test_invalidate_deletes_key_and_is_noop_without_redis`（给 `invalidate` 直接覆盖 ——
+> 原稿只靠 Task 4 的用例间接碰到它）。
 
 **Step 5：提交**
 
