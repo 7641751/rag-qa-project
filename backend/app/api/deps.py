@@ -11,6 +11,7 @@ from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from redis import asyncio as aioredis
 
+from config import settings
 from backend.app.agent.schemas import AuthUser
 from backend.tools.http_tools import api_error
 from backend.tools.security import decode_token
@@ -55,4 +56,30 @@ async def get_redis_pool(request: Request) -> aioredis.Redis:
     if pool is None:
         raise RuntimeError(
             "Redis 未配置：请在仓库根 .env 里设置 RAGQA_REDIS_URL（或 REDIS_URL）后重启")
+    return aioredis.Redis(connection_pool=pool)
+
+
+async def get_optional_redis(request: Request):
+    """可选的 Redis（缓存用）：不可用时返回 None，由调用方降级回源。
+
+    与 `get_redis_pool` 的分工必须分清：
+      · `get_redis_pool`  —— **硬依赖**：拿不到就报可操作的错（将来真有离不开 Redis 的功能用它）
+      · `get_optional_redis` —— **软依赖**：缓存而已，没有照常工作（P4 设计文档 §7 的核心原则）
+
+    开关 `redis_cache_enabled=False` 时同样返回 None，这样「回滚开关」对调用方完全透明 ——
+    调用方只有一个判断（`redis is None` ⇒ 无缓存），不必再关心开关或配置。
+
+    ⚠ 必须把池**包成客户端**再返回，与 `get_redis_pool` 同理：`app.state.redis_pool` 是
+      `redis.asyncio.connection.ConnectionPool`，它**没有任何命令方法**（已实测：无 get/set/xadd）。
+      直接把它交给 `redis_cache_tools` 会让 `await redis.get(...)` 抛 AttributeError，
+      再被缓存层的宽兜底吞成一条 error 日志 —— 表现为「缓存接好了但命中率恒为 0」，
+      是本功能最难排查的一类假成功。包一层也让两者共用同一个池（不新建连接池）。
+    """
+    if not settings.redis_cache_enabled:
+        return None
+    pool = getattr(request.app.state, "redis_pool", None)
+    if pool is None:
+        # 注意与 get_redis_pool 的差别：这里**不抛异常**。Redis 不可用对缓存只是降级，
+        # 调用方拿到 None 就走 MySQL 直查（P4 设计文档 §7）。
+        return None
     return aioredis.Redis(connection_pool=pool)

@@ -13,7 +13,7 @@ from redis import asyncio as aioredis
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config import settings
-from backend.app.api.deps import get_current_user, get_redis_pool
+from backend.app.api.deps import get_current_user, get_optional_redis, get_redis_pool
 from backend.app.api.errors import register_error_handlers
 from backend.app.agent.schemas import AuthUser
 from backend.tools import security as sec
@@ -120,3 +120,45 @@ def test_get_redis_pool_fails_fast_when_unconfigured():
     msg = str(ei.value)
     assert "RAGQA_REDIS_URL" in msg and "REDIS_URL" in msg, \
         f"错误信息必须指出该配哪个环境变量，实际: {msg}"
+
+
+# ============================ get_optional_redis ============================
+def test_get_optional_redis_returns_none_when_pool_missing():
+    """★ 与 get_redis_pool 的关键区别：池不存在时返回 None（降级），**不抛异常**。
+
+    缓存是可选依赖：Redis 没配或挂了，列表接口必须照常返回数据。
+    get_redis_pool 保持「抛 RuntimeError」是因为它的定位是硬依赖 —— 两者分工不能混。
+    """
+    app = FastAPI()                       # 刻意不设 app.state.redis_pool
+
+    assert asyncio.run(get_optional_redis(_request_for(app))) is None
+
+
+def test_get_optional_redis_returns_none_when_switch_off(monkeypatch):
+    """开关关闭 ⇒ 即使池在也返回 None（让回滚开关对调用方完全透明）。"""
+    monkeypatch.setattr(settings, "redis_cache_enabled", False)
+    app = FastAPI()
+    app.state.redis_pool = object()
+
+    assert asyncio.run(get_optional_redis(_request_for(app))) is None
+
+
+def test_get_optional_redis_returns_command_usable_client():
+    """★ 开关开着且池存在 ⇒ 必须返回**能真的发命令**的客户端，且复用 state 上的池。
+
+    这条挡的是一个「看起来接好了、命中率恒为 0」的静默失效：
+    `app.state.redis_pool` 是 ConnectionPool，**它没有 get/set/xadd**（已实测）。
+    若依赖直接返回池，`cached_json` 里 `await redis.get(...)` 会抛 AttributeError，
+    被缓存层的宽兜底吞成一条 error 日志 —— 接口照常 200，但缓存永远不命中。
+    所以这里既要断言协议可用，也要断言不新建池（每请求新建池会线性涨连接数）。
+    """
+    app = FastAPI()
+    pool = aioredis.ConnectionPool.from_url("redis://127.0.0.1:6399/0", decode_responses=True)
+    app.state.redis_pool = pool
+
+    client = asyncio.run(get_optional_redis(_request_for(app)))
+
+    assert isinstance(client, aioredis.Redis)
+    for method in ("get", "set", "delete", "xadd"):   # xadd 供 Task 7 的消费端复用
+        assert callable(getattr(client, method, None)), f"缺少 {method}：缓存工具会静默降级"
+    assert client.connection_pool is pool, "必须复用 state 上的池，不能另建"

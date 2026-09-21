@@ -3,13 +3,14 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
+from redis import asyncio as aioredis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.agent.schemas import (
     AuthUser, ChatDeleteResponse, ChatRequest,
     RenameRequest, RenameResponse, ThreadListResponse,
 )
-from backend.app.api.deps import get_current_user
+from backend.app.api.deps import get_current_user, get_optional_redis
 from backend.app.services import chat_service
 from backend.tools.mysql_db_tools import get_db_session
 
@@ -17,6 +18,8 @@ router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 DbSession = Annotated[AsyncSession, Depends(get_db_session)]
 CurrentUser = Annotated[AuthUser, Depends(get_current_user)]
+# 缓存用的软依赖：Redis 不可用时注入 None，服务层据此走无缓存路径（不报 5xx）
+RedisOpt = Annotated[aioredis.Redis | None, Depends(get_optional_redis)]
 
 
 @router.post("/stream")
@@ -40,13 +43,16 @@ async def get_chat_history(thread_id: str, user: CurrentUser, db: DbSession):
 
 
 @router.get("/threads", response_model=ThreadListResponse)
-async def list_chat_threads(user: CurrentUser, db: DbSession):
+async def list_chat_threads(user: CurrentUser, db: DbSession, redis: RedisOpt):
     """当前用户的会话列表，按 `updated_at` 倒序、最多 50 条（P3 §7.1）。
 
     只返回本人的：查询走 `ix_conversations_user_updated (user_id, updated_at DESC)`。
     空列表返回 `200 {threads:[], total:0}`，**不是 404** —— 新用户进来就是这个状态。
+
+    P4 起结果走 Redis 读缓存；Redis 不可用（未配置/开关关闭/连不上）时 `redis` 为 None，
+    自动降级直查 MySQL，**响应结构与内容完全不变**。
     """
-    return await chat_service.list_chat_threads(user.id, db)
+    return await chat_service.list_chat_threads(user.id, db, redis)
 
 
 @router.patch("/threads/{thread_id}", response_model=RenameResponse)

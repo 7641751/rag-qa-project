@@ -5,15 +5,20 @@ chat_service 模块包含聊天相关的服务。
 from langchain_core.messages import HumanMessage, AIMessage, AIMessageChunk
 from langchain_core.runnables import RunnableConfig
 import json
+import logging
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from config import settings
 from backend.app.agent.schemas import (
     ChatRequest, RAGState, HistoryResponse, HistoryMessage, ChatDeleteResponse,
     ConversationSummary, ThreadListResponse, RenameResponse,
 )
 from backend.app.agent.graph import RetrievalError, build_graph, get_graph
 from backend.app.services import conversation_service
+from backend.tools.redis_cache_tools import cached_json, conv_list_key, invalidate
+
+logger = logging.getLogger(__name__)
 
 LABELS = {"retrieve": "检索", "grade_documents": "评分",
           "rewrite_query": "重写", "generate": "生成"}
@@ -148,18 +153,69 @@ async def delete_chat_thread(thread_id: str, user_id: int,
     await db.commit()
     return ChatDeleteResponse(thread_id=thread_id, deleted=existed)
 
-async def list_chat_threads(user_id: int, db: AsyncSession) -> ThreadListResponse:
-    """当前用户的会话列表（对齐契约 §7.1）。
+async def list_chat_threads(user_id: int, db: AsyncSession,
+                            redis=None) -> ThreadListResponse:
+    """当前用户的会话列表（对齐契约 §7.1），带 Redis 读缓存（P4）。
 
-    只做「ORM 行 → 契约模型」的搬运，排序 / 上限 / total 口径都在
-    conversation_service.list_conversations 里，本层不再重复判断。
+    排序 / 上限 / total 口径仍在 `conversation_service.list_conversations` 里，
+    本层只加缓存与「ORM/JSON → 契约模型」的搬运，不改查询本身。
+
+    缓存载荷结构 `{"user_id": N, "total": M, "threads": [...]}`：
+      · `user_id` 用于**自校验** —— 键串了/被塞了值时当 miss，绝不返回别人的数据；
+      · `total` 必须一起缓存，它是前端「仅显示最近 50 条」的唯一依据（P3 §7.1）。
+      · 时间转成 ISO 字符串存：`datetime` 进不了 JSON，且契约侧本来就要求 ISO 8601。
+
+    `redis=None` ⇒ 无缓存路径，行为与 P3 逐字一致（未配置 Redis 或开关关闭时就是这样）。
+    授权不在这里：`assert_owner` 的调用链上没有任何 redis 参数（P4 设计文档 §7）。
     """
-    rows, total = await conversation_service.list_conversations(db, user_id)
+    async def _load() -> dict:
+        # 回源就是 P3 那段原封不动的查询 + 搬运，缓存只在它外面套一层
+        rows, total = await conversation_service.list_conversations(db, user_id)
+        return {"user_id": user_id, "total": total,
+                "threads": [{"thread_id": r.thread_id, "title": r.title,
+                             "created_at": r.created_at.isoformat(),
+                             "updated_at": r.updated_at.isoformat()} for r in rows]}
+
+    key = conv_list_key(user_id)
+    # 注意：`_load` 里的 MySQL 异常由 cached_json 原样上抛（缓存层只兜自己的错），
+    # 行为与 P3 一致 —— 库挂了就是 500，不会被伪装成「降级成功」而返回空列表。
+    payload = await cached_json(redis, key, settings.conv_cache_ttl, _load)
+
+    # 自校验：归属不符 / 顶层结构不符 / **单个元素字段不全** → 一律当 miss 并清掉坏键。
+    # 元素级校验不能省：`{"threads":[{}]}` 是合法 JSON，却会让下面的
+    # `ConversationSummary(**)` 抛 TypeError → 500，那正是「缓存故障升级成业务故障」。
+    if not _is_valid_payload(payload, user_id):
+        logger.error("[cache] 载荷归属或结构异常，丢弃 key=%s", key)
+        await invalidate(redis, key)
+        payload = await _load()
+
     return ThreadListResponse(
-        threads=[ConversationSummary(thread_id=r.thread_id, title=r.title,
-                                     created_at=r.created_at, updated_at=r.updated_at)
-                 for r in rows],
-        total=total)
+        threads=[ConversationSummary(**t) for t in payload["threads"]],
+        total=payload["total"])
+
+
+# 缓存载荷里每个会话项必须具备的字段（与 ConversationSummary 的必填字段一一对应）
+_REQUIRED_THREAD_FIELDS = ("thread_id", "title", "created_at", "updated_at")
+
+
+def _is_valid_payload(payload, user_id: int) -> bool:
+    """缓存载荷自校验：归属正确 + `total` 是整数 + `threads` 每项四个必填字段齐全。
+
+    写成纯函数是为了能脱离 DB/Redis 单测它 —— 这是「缓存故障不得升级为业务故障」
+    这条承诺上唯一需要判断逻辑的地方，而它一旦写漏就得靠线上 500 才发现。
+
+    `total` 单独校验的原因同 P3：它是前端「仅显示最近 50 条」的唯一依据，
+    缺失或非整数时前端会把「被截断」当成「一共就这么多」。
+    """
+    if not isinstance(payload, dict) or payload.get("user_id") != user_id:
+        return False
+    if not isinstance(payload.get("total"), int):
+        return False
+    threads = payload.get("threads")
+    if not isinstance(threads, list):
+        return False
+    return all(isinstance(t, dict) and all(f in t for f in _REQUIRED_THREAD_FIELDS)
+               for t in threads)
 
 
 async def rename_chat_thread(thread_id: str, user_id: int, title: str,
