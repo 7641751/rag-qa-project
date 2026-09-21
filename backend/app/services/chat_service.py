@@ -131,11 +131,14 @@ def _msg_to_history(m):
     return None  # SystemMessage 等不进历史
 
 
-async def delete_chat_thread(thread_id: str, user_id: int,
-                             db: AsyncSession) -> ChatDeleteResponse:
+async def delete_chat_thread(thread_id: str, user_id: int, db: AsyncSession,
+                             redis=None) -> ChatDeleteResponse:
     """删除一个会话的全部服务端状态：checkpoints + writes + 归属索引行。
 
     幂等：不存在也返回 deleted=False。归属校验在前（非本人 → 403，不产生任何副作用）。
+
+    删除后失效会话列表缓存（P4）：本函数自己 `commit()`，所以删键紧跟其后是安全的。
+    `redis=None`（未配置 / 开关关闭）时 `invalidate` 直接返回，行为与 P3 一致。
     """
     await conversation_service.assert_owner(db, thread_id, user_id)
     checkpointer = get_graph().checkpointer
@@ -158,6 +161,9 @@ async def delete_chat_thread(thread_id: str, user_id: int,
     # 「列表里已消失但历史还在」（再删一次即可），比留下孤儿行好排查。
     await conversation_service.delete_conversation_row(db, thread_id)
     await db.commit()
+    # ⚠ 删键必须在 commit **之后**（P4 设计文档 §4 顺序 1）。反过来会留下「库还是旧行、
+    # 缓存已空」的窗口，被并发读把旧列表回填进缓存 —— 且这次要等满 TTL 才自愈。
+    await invalidate(redis, conv_list_key(user_id))
     return ChatDeleteResponse(thread_id=thread_id, deleted=existed)
 
 async def list_chat_threads(user_id: int, db: AsyncSession,
@@ -247,25 +253,41 @@ def _is_valid_payload(payload, user_id: int) -> bool:
 
 
 async def rename_chat_thread(thread_id: str, user_id: int, title: str,
-                             db: AsyncSession) -> RenameResponse:
+                             db: AsyncSession, redis=None) -> RenameResponse:
     """重命名会话。403（非本人）与 404（不存在）由服务层 api_error 抛出，
-    路由不加 try —— 异常经 errors.py 的处理器统一转成契约错误体。"""
+    路由不加 try —— 异常经 errors.py 的处理器统一转成契约错误体。
+
+    改名后失效会话列表缓存（P4）：`rename_conversation` **内部**已经
+    `commit()`（conversation_service.py），所以此处删键位于 commit 之后。
+    要放在 `conversation_service` 里删就得让它知道 redis —— 那会污染一个与缓存无关的模块，
+    且它并非所有函数都 commit（见 `delete_conversation_row`），顺序契约会变得看调用方而定。
+    """
     row = await conversation_service.rename_conversation(db, thread_id, user_id, title)
+    await invalidate(redis, conv_list_key(user_id))
     return RenameResponse(thread_id=row.thread_id, title=row.title)
 
 
 async def prepare_stream(chat_request: ChatRequest, user_id: int,
-                         db: AsyncSession):
+                         db: AsyncSession, redis=None):
     """鉴权 + upsert 完成后，把流生成器交给路由。
 
     必须与 stream_chat 分开：`403` 要在返回 StreamingResponse **之前**抛出，
     一旦响应头发出就只能降级成 SSE error 帧，前端得为同一端点写两套错误处理。
 
     返回的是异步生成器（不是协程），路由直接交给 StreamingResponse。
+
+    ⚠ 授权（`assert_owner`）**永不走缓存**：它上面一个 redis 参数都没有，读的只能是
+    MySQL（P4 设计文档 §4 顺序 2）。这里传进来的 `redis` 只用于「问答落库后失效列表缓存」。
     """
     await conversation_service.assert_owner(db, chat_request.thread_id, user_id)
     await conversation_service.upsert_conversation(
         db, thread_id=chat_request.thread_id, user_id=user_id,
         question=chat_request.question)
     await db.commit()
+    # ⚠ 删键必须在 commit **之后**（P4 设计文档 §4 顺序 1）：先删后写会留下「库旧、缓存空」
+    # 的窗口被并发读回填旧值，且要等满 TTL 才自愈。本函数自己 commit，所以顺序由这里保证。
+    await invalidate(redis, conv_list_key(user_id))
+    # NOTE(P4 Task 6)：这里要再改成 `stream_chat(chat_request, user_id, redis=redis,
+    # started_at=time.perf_counter())`，让 MQ 生产端拿到 redis 与计时起点。
+    # 本 task 不加：`stream_chat` 的这两个形参属于 Task 6，提前传会 TypeError。
     return stream_chat(chat_request, user_id)

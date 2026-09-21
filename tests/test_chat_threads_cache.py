@@ -25,7 +25,8 @@ from sqlalchemy.pool import StaticPool
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from backend.app.models import Base
+from backend.app.agent.schemas import ChatRequest
+from backend.app.models import Base, Conversation
 from backend.app.services import chat_service, conversation_service
 from backend.tools.redis_cache_tools import conv_list_key
 
@@ -383,3 +384,182 @@ def test_endpoint_actually_passes_redis_to_service(maker, monkeypatch):
     assert body["threads"][0]["created_at"].endswith("Z"), "契约要带 Z 的 ISO 8601"
     assert ("get", conv_list_key(1)) in redis.calls, "端点没把 redis 交给服务层"
     assert redis.store.get(conv_list_key(1)), "服务层必须写回缓存"
+
+
+# ============================ 6. 写路径失效（顺序是契约）============================
+@pytest.fixture
+def fake_graph(monkeypatch):
+    """把 `chat_service.get_graph` 换成只有 checkpointer 的替身。
+
+    本节的焦点是「MySQL commit 与 Redis DEL 的先后」，`delete_chat_thread` 里的
+    checkpoint 删除只是必经的一段噪声。不换的话会走到真实的 `AsyncSqliteSaver`
+    （默认写 `data/checkpoints.db`）—— 离线套件不该碰真实文件（与
+    tests/test_chat_ownership.py 的 fake_graph 同一出发点）。
+    InMemorySaver 是纯内存实现，不需要编译整张图，因此这里只造 graph.checkpointer 这一处。
+    """
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    class _StubGraph:
+        checkpointer = InMemorySaver()
+
+    monkeypatch.setattr(chat_service, "get_graph", lambda: _StubGraph())
+
+
+def _assert_commit_immediately_followed_by_delete(order, key, paths: int = 3):
+    """断言序列里每个 `commit` 的**紧邻下一个**动作都是 `delete`。
+
+    为什么用「同一序列」而不是「两边各自断言都发生过」：后者在「先 DEL 后 commit」
+    的实现下**照样绿**（两种动作都发生过），而那种顺序会把旧值留在库里、缓存已空，
+    并发读会把旧值回填缓存 —— 那是本期最贵的一种错（要等满 TTL 才自愈）。
+    把两个来源拷进同一个 list，才断言得了「谁紧挨着谁」。
+    """
+    seq = [x if isinstance(x, str) else x[0] for x in order]
+    assert seq.count("commit") == paths, f"应恰好 {paths} 次 commit，实际序列: {seq}"
+    for i, item in enumerate(seq):
+        if item == "commit":
+            assert i + 1 < len(seq) and seq[i + 1] == "delete", \
+                f"commit 之后必须紧跟 delete（先删后写会留旧值回填窗口），实际序列: {seq}"
+    deletes = [x for x in order if not isinstance(x, str)]
+    assert len(deletes) == paths and all(x[1] == key for x in deletes), \
+        f"三处写路径都必须失效同一个键，实际: {deletes}"
+
+
+def test_order_assertion_detects_reversed_write():
+    """变异自检：把「先 DEL 后 commit」的序列喂给上面那条断言，它必须报错。
+
+    没有这条，「顺序契约被钉住」可能只是错觉 —— 一个写得过宽的断言（比如只数个数）
+    在错误实现下也全绿。这里用错误序列反证断言真的有判别力。
+    """
+    key = conv_list_key(1)
+    wrong_order = [
+        ("delete", key), "commit",          # ① 提问路径写反了
+        "commit", ("delete", key),          # ② 正确
+        "commit", ("delete", key),          # ③ 正确
+    ]
+
+    with pytest.raises(AssertionError):
+        _assert_commit_immediately_followed_by_delete(wrong_order, key)
+
+
+def test_write_paths_invalidate_after_commit(maker, fake_graph):
+    """★ 顺序契约：三处写路径都必须「先 MySQL commit、后 DEL」。
+
+    判据把 SQLAlchemy 的 `after_commit` 事件与假 Redis 的调用记录打进**同一个 list**，
+    再断言相邻关系。
+
+    ⚠ 事件挂在 `db.sync_session` 上，不是计划里写的 `db.bind.sync_engine`：
+    `after_commit` 是 `SessionEvents` 的事件，挂在 Engine 上会直接
+    `AttributeError: after_commit`（实测），根本注册不上、更不会触发。
+    AsyncSession 支持透传 SessionEvents，所以目标换成它底下的 sync Session。
+    """
+    from sqlalchemy import event
+
+    redis = FakeRedis()
+    order = []
+
+    async def go():
+        async with maker() as db:
+            event.listen(db.sync_session, "after_commit",
+                         lambda *a, **k: order.append("commit"))
+            redis.calls = order            # 让两个来源写进同一个序列
+
+            # ① 提问路径（prepare_stream 自己 commit）
+            await chat_service.prepare_stream(
+                ChatRequest(thread_id="t9", question="新问题"), 1, db, redis=redis)
+            # ② 改名路径（rename_conversation **内部**已 commit）
+            await chat_service.rename_chat_thread("t9", 1, "新标题", db, redis=redis)
+            # ③ 删除路径（delete_chat_thread 自己 commit）
+            await chat_service.delete_chat_thread("t9", 1, db, redis=redis)
+
+    asyncio.run(go())
+
+    _assert_commit_immediately_followed_by_delete(order, conv_list_key(1))
+
+
+def test_invalidate_is_noop_without_redis(maker, fake_graph):
+    """`redis=None`（未配置 / 开关关闭）时，三处写路径照常跑完、不抛异常。
+
+    ⚠ 只断言「不抛异常」太弱：把 `invalidate` 写成 `return` 之前意外 `raise`、
+    或干脆把整段业务逻辑跳过的实现，也可能不抛。所以顺带断言业务真的生效
+    （upsert 落库、rename 生效、delete 真的删掉行）。
+    """
+    async def go():
+        async with maker() as db:
+            await chat_service.prepare_stream(
+                ChatRequest(thread_id="t8", question="问题"), 1, db, redis=None)
+            assert (await db.get(Conversation, "t8")).title == "问题", "upsert 必须照常落库"
+
+            renamed = await chat_service.rename_chat_thread("t8", 1, "标题", db, redis=None)
+            assert renamed.title == "标题", "rename 必须照常生效"
+
+            deleted = await chat_service.delete_chat_thread("t8", 1, db, redis=None)
+            assert deleted.thread_id == "t8"
+            assert await db.get(Conversation, "t8") is None, "delete 必须照常删掉索引行"
+
+    asyncio.run(go())
+
+
+# ============================ 7. 三个写端点的接线 ============================
+def test_write_endpoints_forward_redis(maker, fake_graph, monkeypatch):
+    """★ 三个写端点必须真的把 `RedisOpt` 传进服务层。
+
+    服务层对了、端点忘了透传，是这类改动最常见的漏法：接口照常 200、单测照常绿，
+    线上却是「写路径从不失效」——列表陈旧到 TTL 才收敛，且没人会怀疑到缓存头上。
+    tests/test_chat_threads.py 的既有端点用例走的都是 `redis=None`，证明不了接线。
+
+    `POST /stream` 用 spy 顶掉 `prepare_stream`：这里要验的是**路由的转发**，
+    不是流图本身（流图在 test_chat_stream.py）。PATCH/DELETE 则真跑服务层，
+    验「缓存键真的被删掉」这一最终效果。
+    """
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from config import settings as _settings
+    from backend.app.api import chat_router
+    from backend.app.api.deps import get_optional_redis
+    from backend.app.api.errors import register_error_handlers
+    from backend.tools import security as sec
+    from backend.tools.mysql_db_tools import get_db_session
+
+    _seed(maker)
+    redis = FakeRedis()
+    monkeypatch.setattr(_settings, "jwt_secret", "unit-test-secret-" + "0" * 26)
+
+    # POST /stream：记录路由下发进来的 redis，不真跑图
+    seen = {}
+
+    async def _spy_prepare(chat_request, user_id, db, redis=None):
+        seen["redis"] = redis
+
+        async def _empty_stream():
+            yield "event: done\ndata: {}\n\n"
+        return _empty_stream()
+
+    monkeypatch.setattr(chat_service, "prepare_stream", _spy_prepare)
+
+    app = FastAPI()
+    register_error_handlers(app)
+    app.include_router(chat_router.router)
+
+    async def _override_db():
+        async with maker() as db:
+            yield db
+    app.dependency_overrides[get_db_session] = _override_db
+    app.dependency_overrides[get_optional_redis] = lambda: redis
+
+    client = TestClient(app)
+    client.headers.update({"Authorization": f"Bearer {sec.create_access_token(1, 'alice')}"})
+
+    r_stream = client.post("/api/chat/stream",
+                           json={"thread_id": "t1", "question": "问一句"})
+    assert r_stream.status_code == 200
+    assert seen.get("redis") is redis, "POST /stream 没把 redis 交给 prepare_stream"
+
+    r_patch = client.patch("/api/chat/threads/t1", json={"title": "新标题"})
+    assert r_patch.status_code == 200, r_patch.text
+    assert ("delete", conv_list_key(1)) in redis.calls, "PATCH 改名后没失效缓存"
+
+    r_delete = client.delete("/api/chat/threads/t1")
+    assert r_delete.status_code == 200, r_delete.text
+    deletes = [c for c in redis.calls if c == ("delete", conv_list_key(1))]
+    assert len(deletes) == 2, f"PATCH 与 DELETE 各应删一次键，实际 {len(deletes)} 次"

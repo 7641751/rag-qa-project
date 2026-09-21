@@ -23,12 +23,16 @@ RedisOpt = Annotated[aioredis.Redis | None, Depends(get_optional_redis)]
 
 
 @router.post("/stream")
-async def stream_chat(chat_request: ChatRequest, user: CurrentUser, db: DbSession):
+async def stream_chat(chat_request: ChatRequest, user: CurrentUser, db: DbSession,
+                      redis: RedisOpt):
     """流式聊天（要求登录 + 归属校验）。
 
     403 由 prepare_stream 在返回 StreamingResponse 之前抛出。
+
+    `redis` 只用于「upsert 落库后失效会话列表缓存」，与授权无关
+    （归属校验在 MySQL，见 prepare_stream）。
     """
-    agen = await chat_service.prepare_stream(chat_request, user.id, db)
+    agen = await chat_service.prepare_stream(chat_request, user.id, db, redis)
     return StreamingResponse(
         agen, media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive",
@@ -57,20 +61,24 @@ async def list_chat_threads(user: CurrentUser, db: DbSession, redis: RedisOpt):
 
 @router.patch("/threads/{thread_id}", response_model=RenameResponse)
 async def rename_chat_thread(thread_id: str, body: RenameRequest,
-                             user: CurrentUser, db: DbSession):
+                             user: CurrentUser, db: DbSession, redis: RedisOpt):
     """重命名会话（P3 §7.1）。
 
     失败：非本人 → 403、不存在 → 404、标题空/纯空格/超 60 字 → 422
     （最后一条由 RenameRequest 在进入服务层之前就拦掉）。
+
+    P4：改名成功后失效该用户的会话列表缓存（顺序由服务层保证为「先 commit 后 DEL」）。
     """
-    return await chat_service.rename_chat_thread(thread_id, user.id, body.title, db)
+    return await chat_service.rename_chat_thread(thread_id, user.id, body.title, db, redis)
 
 
 @router.delete("/threads/{thread_id}", response_model=ChatDeleteResponse)
-async def delete_chat(thread_id: str, user: CurrentUser, db: DbSession):
+async def delete_chat(thread_id: str, user: CurrentUser, db: DbSession, redis: RedisOpt):
     """删除一个会话在服务端的全部状态（checkpoints + writes + 索引行）。
 
     不可恢复；幂等：未知/已删过的 thread_id 返回 deleted=false（非 404）。
     thread_id 用 str 而非 UUID：与 /history 一致，契约也建议后端用 str。
+
+    P4：删除成功后失效该用户的会话列表缓存（顺序由服务层保证为「先 commit 后 DEL」）。
     """
-    return await chat_service.delete_chat_thread(thread_id, user.id, db)
+    return await chat_service.delete_chat_thread(thread_id, user.id, db, redis)
