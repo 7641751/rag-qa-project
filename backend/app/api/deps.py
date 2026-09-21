@@ -59,7 +59,7 @@ async def get_redis_pool(request: Request) -> aioredis.Redis:
     return aioredis.Redis(connection_pool=pool)
 
 
-async def get_optional_redis(request: Request):
+async def get_optional_redis(request: Request) -> aioredis.Redis | None:
     """可选的 Redis（缓存用）：不可用时返回 None，由调用方降级回源。
 
     与 `get_redis_pool` 的分工必须分清：

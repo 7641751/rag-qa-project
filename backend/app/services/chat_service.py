@@ -7,6 +7,7 @@ from langchain_core.runnables import RunnableConfig
 import json
 import logging
 
+from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings
@@ -22,6 +23,12 @@ logger = logging.getLogger(__name__)
 
 LABELS = {"retrieve": "检索", "grade_documents": "评分",
           "rewrite_query": "重写", "generate": "生成"}
+
+# 缓存载荷里每个会话项必须具备的字段，与 ConversationSummary 的必填字段一一对应。
+# ⚠ 两者没有类型层面的同步机制：给 ConversationSummary 加必填字段时这份清单会**悄悄落后**
+# （落后不报错，代价是「新字段缺失的载荷」又能穿过去直捣 `ConversationSummary(**)` 拿 500）。
+# 兜底机制是 tests/test_chat_threads_cache.py::test_required_fields_match_schema —— 加字段时它会红。
+_REQUIRED_THREAD_FIELDS = ("thread_id", "title", "created_at", "updated_at")
 
 
 async def stream_chat(chat_request: ChatRequest, user_id: int | None = None):
@@ -181,35 +188,56 @@ async def list_chat_threads(user_id: int, db: AsyncSession,
     # 行为与 P3 一致 —— 库挂了就是 500，不会被伪装成「降级成功」而返回空列表。
     payload = await cached_json(redis, key, settings.conv_cache_ttl, _load)
 
-    # 自校验：归属不符 / 顶层结构不符 / **单个元素字段不全** → 一律当 miss 并清掉坏键。
-    # 元素级校验不能省：`{"threads":[{}]}` 是合法 JSON，却会让下面的
-    # `ConversationSummary(**)` 抛 TypeError → 500，那正是「缓存故障升级成业务故障」。
+    # ── 第一层（廉价前置）：归属 / 顶层结构 / 元素字段齐不齐 ──
+    # 它守的是 pydantic **守不住**的那两条设计意图（见 `_is_valid_payload` docstring）：
+    # `user_id` 归属精确匹配、`total` 必须是「真 int」。所以这一层不能换成 try/except。
     if not _is_valid_payload(payload, user_id):
         logger.error("[cache] 载荷归属或结构异常，丢弃 key=%s", key)
         await invalidate(redis, key)
-        payload = await _load()
+        # 刻意**不回填**：回填要多一条写路径、多一处可能把坏值重新写进去的代码；
+        # 代价仅是「下一次请求 miss 一次、回源 1ms」（P4 §2 实测，索引扫描）。
+        return _to_response(await _load())
 
+    # ── 第二层（权威兜底）：形状以 pydantic 为准 ──
+    # 字段齐全但**类型/可解析性**不符（实测 `created_at:"not-a-date"`、`title:{"a":1}`）会
+    # 通过上面的廉价前置，却在 `_to_response` 里抛 ValidationError —— 它继承 ValueError，
+    # errors.py 的两个 handler 都不接，于是落到 Starlette 默认 500，且**坏键不被删**
+    # （无 TTL 时该用户的列表接口会永久 500 直到人工清理）。元素级校验替代不了这一层：
+    # pydantic v2 宽松模式会把 "1"/True 强转成 int(1)，判据宽严不同、互补而非重复。
+    try:
+        return _to_response(payload)
+    except (ValidationError, TypeError, KeyError):
+        # ⚠ 只包 `_to_response(payload)`，**不包**下面的回源：回源结果若也不合法，那是我们
+        # 自己的 bug，应该照常 500 炸出来，不能被这里伪装成「缓存故障」而静默。
+        logger.error("[cache] 载荷无法构成契约响应，丢弃 key=%s", key)
+        await invalidate(redis, key)
+        return _to_response(await _load())
+
+
+def _to_response(payload: dict) -> ThreadListResponse:
+    """缓存载荷 → 契约响应。缓存里的坏值在这里暴露成 pydantic 校验错误，由调用方兜底。"""
     return ThreadListResponse(
         threads=[ConversationSummary(**t) for t in payload["threads"]],
         total=payload["total"])
 
 
-# 缓存载荷里每个会话项必须具备的字段（与 ConversationSummary 的必填字段一一对应）
-_REQUIRED_THREAD_FIELDS = ("thread_id", "title", "created_at", "updated_at")
-
-
 def _is_valid_payload(payload, user_id: int) -> bool:
-    """缓存载荷自校验：归属正确 + `total` 是整数 + `threads` 每项四个必填字段齐全。
+    """缓存载荷自校验：归属正确 + `total` 是**真 int** + `threads` 每项四个必填字段齐全。
 
-    写成纯函数是为了能脱离 DB/Redis 单测它 —— 这是「缓存故障不得升级为业务故障」
-    这条承诺上唯一需要判断逻辑的地方，而它一旦写漏就得靠线上 500 才发现。
+    写成纯函数是为了能脱离 DB/Redis 单测它 —— 这条判据一旦写漏，就得靠线上 500 才发现。
+    （调用方还有一层 try/except 以 pydantic 为准兜底，但那一层兜不住本函数守的两条意图，
+    见下。）
 
-    `total` 单独校验的原因同 P3：它是前端「仅显示最近 50 条」的唯一依据，
-    缺失或非整数时前端会把「被截断」当成「一共就这么多」。
+    它**不可**被「交给 pydantic 兜」替代，两处设计意图 pydantic 宽松模式都不执行：
+      · 归属：schema 里根本没有 `user_id` 字段，pydantic 无从判「这是不是本人的数据」；
+      · `total` 必须是真 int：pydantic 会把 `"1"`、`True` 强转成 1，而它是前端判断
+        「结果被截断」的唯一依据（P3 §7.1），被强转就等于把「截断了」说成「就这么少」。
+    所以 `isinstance(x, int)` 在这里**不够**（`isinstance(True, int) is True`），
+    必须用 `type(x) is int`。这也是为什么第二层 try/except 不能取代本函数。
     """
     if not isinstance(payload, dict) or payload.get("user_id") != user_id:
         return False
-    if not isinstance(payload.get("total"), int):
+    if type(payload.get("total")) is not int:
         return False
     threads = payload.get("threads")
     if not isinstance(threads, list):
