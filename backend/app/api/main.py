@@ -9,13 +9,27 @@ from backend.tools.mysql_db_tools import init_db, aclose_db
 from config import settings
 from backend.app.agent.schemas import Health
 from backend.app.api import auth_router, chat_router, kb_router
+from redis import asyncio as aioredis
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     # 启动：异步 checkpointer 依赖事件循环，首个请求时惰性构造，无需预热
     await init_db()
+    # ⚠ 未配置时**不能**无条件建池：from_url("") 会抛
+    #   ValueError: Redis URL must specify one of the following schemes (redis://, ...)
+    #   那会让整个后端起不来。Redis 目前是可选依赖，缺它不该拖垮启动 ——
+    #   未配置就置 None，把可操作的报错留给真正用到它的 get_redis_pool。
+    redis_url = (settings.redis_url or "").strip()
+    app.state.redis_pool = (
+        aioredis.ConnectionPool.from_url(redis_url, decode_responses=True)
+        if redis_url else None
+    )
     yield
     from backend.app.agent.graph import aclose_checkpointer
+    # 与 init_db/aclose_db 成对：池也要显式关，否则那些连接会一直留在服务端，
+    # 直到 Redis 的 timeout 才回收（重启几次就把 maxclients 占满）。
+    if app.state.redis_pool is not None:
+        await app.state.redis_pool.aclose()
     await aclose_db()  # 引擎 dispose + **成对**清空两个 lru_cache
     await aclose_checkpointer()
 
