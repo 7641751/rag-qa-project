@@ -123,10 +123,13 @@ qa_stream_key: str = "ragqa:stream:qa_stats"
 新增 `backend/tools/redis_cache_tools.py`（纯工具，不碰请求上下文）：
 
 ```python
-async def cached_json(redis, key: str, ttl: int, loader) -> tuple[Any, bool]
-    """cache-aside 读：命中返回 (值, True)；miss/损坏/异常则调 loader 回源并写回。
+async def cached_json(redis, key: str, ttl: int, loader) -> object
+    """cache-aside 读：命中直接返回缓存值；miss / 坏值 / 任何异常都调 loader 回源。
     任何 Redis 异常都在这里被吞掉并记 warning —— 调用方永远拿到可用数据。"""
 ```
+
+返回值刻意**不带 hit 标志位**（初稿画的是 `tuple[Any, bool]`）：本期没有任何调用方需要区分
+「命中」与「回源」——命中率该看日志/指标，不该靠改接口形状去承载。
 
 `list_conversations` 的调用点改成先走它。**关键实现约束**：
 
