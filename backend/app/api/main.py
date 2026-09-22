@@ -1,4 +1,5 @@
-from contextlib import asynccontextmanager
+import asyncio
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,7 +25,21 @@ async def lifespan(_: FastAPI):
         aioredis.ConnectionPool.from_url(redis_url, decode_responses=True)
         if redis_url else None
     )
+    # 问答事件消费端（P4 Task 7）：统计是可丢的派生数据 —— 只配了 Redis 才起，
+    # 起不来/挂掉都不影响任何业务请求（失败由它自己吞、只记日志）。
+    consumer_task = None
+    if app.state.redis_pool is not None:
+        from backend.app.services.qa_event_consumer import consume
+        from backend.tools.mysql_db_tools import get_db_session_maker
+        consumer_task = asyncio.create_task(
+            consume(aioredis.Redis(connection_pool=app.state.redis_pool),
+                    get_db_session_maker()))
     yield
+    # 先停消费端、再关池（它在用池）—— 既有清理顺序（池 → 引擎 → checkpointer）不动。
+    if consumer_task is not None:
+        consumer_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await consumer_task
     from backend.app.agent.graph import aclose_checkpointer
     # 与 init_db/aclose_db 成对：池也要显式关，否则那些连接会一直留在服务端，
     # 直到 Redis 的 timeout 才回收（重启几次就把 maxclients 占满）。

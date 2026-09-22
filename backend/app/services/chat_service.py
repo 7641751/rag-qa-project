@@ -328,7 +328,8 @@ async def prepare_stream(chat_request: ChatRequest, user_id: int,
     # ⚠ 删键必须在 commit **之后**（P4 设计文档 §4 顺序 1）：先删后写会留下「库旧、缓存空」
     # 的窗口被并发读回填旧值，且要等满 TTL 才自愈。本函数自己 commit，所以顺序由这里保证。
     await invalidate(redis, conv_list_key(user_id))
-    # NOTE(P4 Task 6)：这里要再改成 `stream_chat(chat_request, user_id, redis=redis,
-    # started_at=time.perf_counter())`，让 MQ 生产端拿到 redis 与计时起点。
-    # 本 task 不加：`stream_chat` 的这两个形参属于 Task 6，提前传会 TypeError。
-    return stream_chat(chat_request, user_id)
+    # P4 Task 7 接线：把 redis 与计时起点交给 stream_chat，激活 MQ 生产端（此前无 task
+    # 认领、NOTE 遗留于 Task 4）。started_at 用 perf_counter：与 _emit_qa_event 同进程
+    # 同钟（跨进程读数不可比）；取值点在这里 ⇒ 计时口径 = 流交给路由后的问答全过程。
+    return stream_chat(chat_request, user_id, redis=redis,
+                       started_at=time.perf_counter())

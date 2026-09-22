@@ -563,3 +563,38 @@ def test_write_endpoints_forward_redis(maker, fake_graph, monkeypatch):
     assert r_delete.status_code == 200, r_delete.text
     deletes = [c for c in redis.calls if c == ("delete", conv_list_key(1))]
     assert len(deletes) == 2, f"PATCH 与 DELETE 各应删一次键，实际 {len(deletes)} 次"
+
+
+# ============================ 8. prepare_stream 接线（P4 Task 7）============================
+def test_prepare_stream_hands_redis_and_started_at_to_stream(maker, monkeypatch):
+    """★ prepare_stream 必须把 redis 与 started_at 交给 stream_chat（P4 Task 7 接线）。
+
+    不接线的后果是**静默**的：生产端能力全部就位，但真实 API 路径永远传 redis=None ——
+    qa_stats 流一条真实数据都不会有；而 Task 6 的用例直连 stream_chat，证明不了这处转发
+    （接口照常 200、单测照常绿，与本文件 7 区挡的是同一类漏法）。
+    """
+    redis = FakeRedis()
+    seen = {}
+
+    def _spy_stream_chat(chat_request, user_id=None, redis=None, started_at=None):
+        seen["redis"], seen["started_at"] = redis, started_at
+
+        async def _empty():
+            yield "event: done\ndata: {}\n\n"
+        return _empty()
+
+    monkeypatch.setattr(chat_service, "stream_chat", _spy_stream_chat)
+
+    async def go():
+        async with maker() as db:
+            gen = await chat_service.prepare_stream(
+                ChatRequest(question="接线测试", thread_id="t-wire"), 1, db,
+                redis=redis)
+            return [frame async for frame in gen]
+
+    frames = asyncio.run(go())
+
+    assert seen["redis"] is redis, "redis 必须原样透传（生产端据此发事件）"
+    assert isinstance(seen["started_at"], float), \
+        "started_at 必须是 perf_counter 读数（None 会让 latency_ms 恒为 0）"
+    assert frames == ["event: done\ndata: {}\n\n"], "接线不得改变流的消费方式"
