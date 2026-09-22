@@ -1,12 +1,27 @@
 # LangChain 智能问答助手
 
-基于 **CRAG（Corrective RAG）** 简化模式的全栈问答系统：LangGraph 编排「检索 → 评估 → 重写 → 生成」工作流，
+基于 **CRAG（Corrective RAG）** 的全栈多用户问答系统：LangGraph 编排「检索 → 评估 → 重写 → 生成」工作流，
 FastAPI 以 SSE 流式吐出推理步骤与答案 token，React 前端渲染 Markdown 答案并支持**用户自助上传文档进知识库**。
 
-知识库内容是 **LangChain / LangGraph 官方文档**（88 篇 md，切分后 2885 段向量），所以它同时也是个「问框架文档」的实用工具。
+知识库内容是 **LangChain / LangGraph 官方文档**（88 篇 md，切分后 2885 段向量；加上用户上传件后当前共 3755 段），
+所以它同时也是个「问框架文档」的实用工具。
 
-> 接口契约的唯一真相源是 [`docs/api/README.md`](docs/api/README.md) + [`docs/api/openapi.yaml`](docs/api/openapi.yaml)。
+**多用户**：JWT 鉴权 + MySQL 归属表，上传件按 `user_id` 隔离 —— 预置官方文档全局共享，用户上传件仅本人可见
+（检索 / 列表 / 删除 / 同名替换四处统一过滤）。
+
+> **接口契约的唯一真相源是 [`docs/api/README.md`](docs/api/README.md) + [`docs/api/openapi.yaml`](docs/api/openapi.yaml)。**
 > 要增删字段或事件类型：**先改契约，再改后端实现与前端 `types.ts` / `client.ts`**，保持三者一致。
+
+<!-- CI 徽章：创建独立仓库后取消注释并把 <owner>/<repo> 换成实际值
+[![CI](https://github.com/<owner>/<repo>/actions/workflows/ci.yml/badge.svg)](https://github.com/<owner>/<repo>/actions/workflows/ci.yml)
+-->
+
+| | |
+|---|---|
+| 端点 | 12 个（含 2 个 SSE 流） |
+| 测试 | 后端 262 例（全离线）/ 前端 148 例，2026-09-22 实测 |
+| CI | GitHub Actions：push / PR 自动跑 `pytest` + `tsc --noEmit` + `vitest` + `vite build`（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)） |
+| 检索评估 | 23 条标注 query 的四配置离线对照，见「[检索评估](#检索评估)」 |
 
 ---
 
@@ -14,14 +29,19 @@ FastAPI 以 SSE 流式吐出推理步骤与答案 token，React 前端渲染 Mar
 
 | 层 | 选型 | 说明 |
 |---|---|---|
-| 工作流编排 | LangGraph `StateGraph` | 4 节点 + 条件路由 + 重写回环，`InMemorySaver` 做服务端会话记忆 |
+| 工作流编排 | LangGraph `StateGraph` | 4 节点 + 条件路由 + 重写回环；`AsyncSqliteSaver`（`data/checkpoints.db`）做服务端会话记忆 |
 | 生成 / 评估 / 重写 | DeepSeek `deepseek-chat` | `temperature=0.1`，`streaming=True`；评估与重写走 `with_structured_output` |
 | 嵌入 | DashScope `qwen3.7-text-embedding` | 云端多语言模型，**单次批量上限 20 条**，全项目统一按 10 条/批写入 |
 | 向量库 | Chroma（本地持久化） | 单集合 `langchain_docs`，预置文档与用户上传**同集合**，靠 metadata 区分 |
-| 后端 | FastAPI + uvicorn | 6 个端点，其中 2 个是 SSE 流 |
-| 前端 | React 18 + Vite 5 + TypeScript 5.5 + Tailwind 3 | `react-markdown` + `highlight.js` 渲染答案，`fetch` + `ReadableStream` 消费 SSE |
+| 鉴权 | JWT（PyJWT HS256）+ bcrypt | `RAGQA_JWT_SECRET` 必须 ≥ 32 字节（RFC 7518 §3.2），否则**启动即失败**；401/403 分工见契约文档 |
+| 关系库 | MySQL 8 + SQLAlchemy 2.0 async（aiomysql） | 用户 / 会话归属（`conversations`）/ 问答事件（`qa_events`）；`mysql_database_url` 为空时快速失败并点名该变量 |
+| 缓存 / MQ | Redis 7（**可选依赖**） | cache-aside 读缓存 + Streams 事件流（消费组 / `event_id` 幂等 / 死信）；`RAGQA_REDIS_CACHE_ENABLED=false` 一键回滚，未配 Redis 则整体旁路 |
+| 后端 | FastAPI + uvicorn | **12 个端点**，其中 2 个是 SSE 流；`/api/health` 为公开就绪探针 |
+| 前端 | React 18 + Vite 5 + TypeScript 5.5 + Tailwind 3 | `react-markdown` + `highlight.js` + `katex` 渲染答案，`fetch` + `ReadableStream` 消费 SSE |
 | 可观测 | LangSmith | `.env` 里 `LANGSMITH_TRACING=true` 即自动上报完整调用树与 token 消耗 |
-| 测试 | pytest（后端）/ vitest（前端） | 全部离线跑，零 API 额度 |
+| 部署 | Docker Compose | MySQL + Redis + backend + frontend（nginx 反代 `/api` 与 `/docs`，两个 SSE 端点均已关缓冲） |
+| 测试 | pytest（后端）/ vitest（前端） | **后端 262 例 / 前端 148 例**，全部离线跑，零 API 额度（数量见「测试」，按需重新生成） |
+| 评估 | 自建检索评估脚本 | 23 条标注 query 的四配置对照（recall / MRR / hit@1 / p50-p95），见「检索评估」 |
 
 ---
 
@@ -68,8 +88,8 @@ FastAPI 以 SSE 流式吐出推理步骤与答案 token，React 前端渲染 Mar
  ChatWindow ──POST /api/chat/stream──────▶ chat_service.stream_chat
               ◀── SSE: step/token/           └─ graph.astream(stream_mode=
                        sources/done ────┘         ["updates","messages"])
-                                                 ├─ retrieve ──as_retriever──▶ langchain_docs
-                                                 ├─ grade_documents  (LLM)       2885 段
+                                                 ├─ retrieve ─similarity_search▶ langchain_docs
+                                                 ├─ grade_documents  (LLM)      3755 段
                                                  ├─ rewrite_query    (LLM)
                                                  └─ generate         (LLM)
 
@@ -89,48 +109,71 @@ FastAPI 以 SSE 流式吐出推理步骤与答案 token，React 前端渲染 Mar
 
 ```
 rag_qa_project/                      ← 唯一 Python 源根（见「开发约定 §1」）
-├── config.py                        # 配置中心（pydantic-settings，RAGQA_ 前缀覆盖）+ .env 加载
+├── config.py                        # 配置中心（pydantic-settings，RAGQA_ 前缀覆盖）+ .env 定位与加载
 ├── ingest.py                        # 预置知识库入库：加载 → 切分 → 嵌入 → Chroma
 ├── run.py                           # CLI 入口：普通 / 流式 / 调试 / 打印图结构
+├── eval_retrieval.py                # 检索离线评估：dense / bm25 / hybrid / hybrid+精排 四配置对照
+├── fetch_langchain_docs.py           # 抓取并清洗官方文档 → data/langchain_docs/
+├── pytest.ini                       # addopts = -m "not redis"（在线用例显式排除，不靠 skip）
+├── requirements.txt                 # 可读依赖清单（实际安装以 pyproject.toml + uv 为准；Docker 按行安装）
+├── Dockerfile / docker-compose.yml  # 全栈部署（MySQL + Redis + backend + frontend nginx）
 ├── scripts/
 │   └── migrate_kb_user_id.py        # P3 一次性迁移：给旧上传件补 user_id（--dry-run / --yes）
-├── requirements.txt                 # 可读依赖清单（实际安装以仓库根 pyproject.toml + uv 为准）
 │
-├── backend/
-│   ├── _sse_upload_demo.py          # SSE 上传最小教学 demo（不碰 LangChain，可单独跑）
-│   └── app/
-│       ├── function_tools.py        # 通用原语：SSE 帧 / 错误响应 / 解析切分 / 嵌入 / metadata 查询
+├── backend/                         # 只放生产代码（教学 demo 已移到 docs/examples/）
+│   ├── tools/                       # 无业务语义的通用能力层
+│   │   ├── upload_function_tools.py # SSE 帧 / 错误响应 / 解析切分 / 嵌入 / metadata 查询
+│   │   ├── mysql_db_tools.py        # SQLAlchemy async 引擎 / 会话工厂 / init_db / aclose_db
+│   │   ├── redis_cache_tools.py     # 连接池 / cached_json / invalidate / 降级封装
+│   │   ├── security.py              # bcrypt 哈希 + JWT 签发与校验
+│   │   └── http_tools.py            # HTTP 客户端辅助
+│   └── app/                         # 业务层：只做编排，不碰底层细节
+│       ├── models.py                # ORM：User / Conversation / QaEvent
 │       ├── agent/
 │       │   ├── graph.py             # LangGraph 工作流 + 单例工厂（get_model/get_vectorstore/get_graph）
 │       │   └── schemas.py           # RAGState、结构化输出 schema、请求/响应模型
 │       ├── api/
-│       │   ├── main.py              # FastAPI 装配：CORS、/api/health、挂载两个 router
-│       │   ├── chat_router.py       # /api/chat/*
-│       │   └── kb_router.py         # /api/kb/*
+│       │   ├── main.py              # FastAPI 装配：lifespan（DB/Redis/消费端）、CORS、/api/health
+│       │   ├── deps.py              # 依赖注入：当前用户、可选 Redis
+│       │   ├── errors.py            # 统一错误码与异常处理器
+│       │   ├── auth_router.py       # /api/auth/*     注册 / 登录 / me
+│       │   ├── chat_router.py       # /api/chat/*     流式问答 / 历史 / 会话列表
+│       │   └── kb_router.py         # /api/kb/*       上传 / 列表 / 删除
 │       └── services/
-│           ├── chat_service.py      # 双模式流式（updates + messages）、节点过滤、历史读取
-│           └── upload_service.py    # 上传 SSE 流：逐批进度、取消回滚、同名替换
+│           ├── chat_service.py      # 双模式流式（updates + messages）、节点过滤、历史读取、MQ 生产
+│           ├── upload_service.py    # 上传 SSE 流：逐批进度、取消回滚、同名替换
+│           ├── auth_service.py      # 注册 / 登录用例
+│           ├── conversation_service.py  # 会话归属与列表（MySQL 真相源）
+│           └── qa_event_consumer.py # 问答事件消费组：幂等落库 + 死信
 │
 ├── frontend/
-│   ├── src/api/                     # client.ts（SSE 解析）+ types.ts（对齐 openapi.yaml）
+│   ├── src/api/                     # client.ts（SSE 解析）+ types.ts（对齐 openapi.yaml）+ tokenStore.ts
 │   ├── src/components/              # ChatWindow / MessageBubble / StepTrace / SourceChips /
 │   │                                # AnswerMarkdown / Composer / Header / Sidebar /
 │   │                                # ConversationItem / LoginPage / ConfirmDialog /
 │   │                                # KnowledgeBaseDrawer / UploadZone / DocList
 │   ├── src/hooks/                   # useChat / useThreadId / useKnowledgeBase /
 │   │                                # useConversations / useSidebar / useAuth
-│   ├── src/test/                    # vitest（jsdom）14 个测试文件
-│   └── mock/server.mjs              # 无后端时联调用：npm run mock 监听 :8000，实现全部 6 个端点
+│   ├── src/test/                    # vitest（jsdom）14 个测试文件 / 148 例
+│   ├── nginx.conf / Dockerfile      # 多阶段构建：Node 打包 → nginx 托管并反代 /api
+│   └── mock/server.mjs              # 无后端时联调用：npm run mock 监听 :8000，实现全部 12 个端点
 │
 ├── data/
 │   ├── langchain_docs/              # 88 篇清洗后的官方文档 md（+ INDEX.md 目录，入库时跳过）
-│   ├── chroma_db/                   # 向量库持久化目录（ingest 后生成）
+│   ├── chroma_db/                   # 向量库持久化目录（ingest 后生成；可重建的派生数据）
+│   ├── checkpoints.db               # LangGraph 会话状态（SQLite checkpointer）
+│   ├── eval_queries.json            # 检索评估的标注集（**源**，进库）
+│   ├── eval_results.json            # 评估产物（可重建，不进库）
 │   └── uploads/                     # 用户上传的原件（自动生成；向量库的真相源）
 │
 ├── docs/
 │   ├── api/                         # README.md（契约）/ openapi.yaml / sse-example.txt / kb-sse-example.txt
-│   └── superpowers/                 # 设计 spec 与实施 plan
+│   ├── examples/sse_upload_demo.py  # SSE 上传最小教学 demo（不碰 LangChain，可单独跑）
+│   └── superpowers/                 # 6 篇设计 spec + 8 篇实施 plan（P1→P4 + 部署 + 简历化改进）
 │
+└── tests/                           # 25 个文件 / 262 例，全部离线（DI 注入 Fake 模型与向量库）
+    └── fixtures/big_sample.md       # 「重复 chunk」分析的样本（非生产数据）
+```
 └── tests/
     ├── test_graph.py                # 11 个用例：图结构、端到端路由、节点单元、路由分支
     └── test_kb_upload.py            # 14 个用例：metadata 落地、SSE 时序、错误码、回滚、幂等
@@ -142,40 +185,68 @@ rag_qa_project/                      ← 唯一 Python 源根（见「开发约�
 
 ### 0. 前置：`.env`
 
-仓库根目录（`my_langchain_demo/.env`）至少需要：
+`.env` 由 `config.py` 的 `_find_env_file()` **由外向内**逐级查找（`RAGQA_ENV_FILE` 可显式指定）：
+
+```
+① RAGQA_ENV_FILE 环境变量指定的路径
+② <PROJECT_DIR>/../../.env     monorepo 布局（外层的开发配置）
+③ <PROJECT_DIR>/../.env        中间层
+④ <PROJECT_DIR>/.env           独立仓库根 / docker 镜像内（/app/.env）
+                               ← 本仓库用的是这个（PROJECT_DIR = 仓库根）
+```
+
+> `PROJECT_DIR` = `config.py` 所在目录，也就是项目根。
+
+> ⚠️ 顺序是**由外向内**、不是「就近优先」。因为 monorepo 布局下同时存在两个用途不同的 `.env`
+> （开发用 `<仓库根>/.env` 含数据库连接串；docker compose 用 `rag_qa_project/.env` 只有容器密码），
+> 就近优先会让本地开发读到 docker 那份、少了 `RAGQA_MYSQL_DATABASE_URL` 而启动失败。
+
+**必填项**（少一个都起不来）：
 
 ```ini
-DEEPSEEK_API_KEY=sk-...          # 生成 / 评估 / 重写
-DASHSCOPE_API_KEY=sk-...         # 文本嵌入
-LANGSMITH_TRACING=true           # 可选：开启调用链追踪
+DEEPSEEK_API_KEY=sk-...                        # 生成 / 评估 / 重写
+DASHSCOPE_API_KEY=sk-...                       # 文本嵌入 + 精排
+RAGQA_JWT_SECRET=<openssl rand -hex 32 的输出>  # ≥32 字节，否则启动期直接抛 ValueError
+RAGQA_MYSQL_DATABASE_URL=mysql+aiomysql://user:pw@127.0.0.1:3306/ragqa
+REDIS_URL=redis://127.0.0.1:6379/0             # 可选，不配则缓存与事件流整体旁路
+```
+
+**可选项**：
+
+```ini
+LANGSMITH_TRACING=true           # 开启调用链追踪
 LANGSMITH_API_KEY=...
 LANGSMITH_PROJECT_NAME=...
 ```
 
-`.env` 由 `config.py` 统一加载。**注意 pydantic-settings 的 `env_file` 只喂给 `Settings` 模型、不会写进
-`os.environ`**，而 `DashScopeEmbeddings` / `ChatDeepSeek` 是用 `os.getenv` 取 key 的——所以 `config.py`
-里显式调了一次 `load_dotenv`，别删。
+> `RAGQA_JWT_SECRET` 的长度在**启动期**就校验（HS256 的 HMAC 密钥要 ≥32 字节，RFC 7518 §3.2），
+> 而不是等第一次签发 token 才警告 —— 早失败比晚失败好排查。
+>
+> ⚠️ **pydantic-settings 的 `env_file` 只喂给 `Settings` 模型、不会写进 `os.environ`**，
+> 而 `DashScopeEmbeddings` / `ChatDeepSeek` 是用 `os.getenv` 取 key 的 —— 所以 `config.py` 里
+> 显式调了一次 `load_dotenv`，**别删**。
 
 ### 1. 安装依赖
 
-依赖由**仓库根**的 `pyproject.toml` + `uv` 管理（`rag_qa_project/requirements.txt` 只是可读清单）：
+依赖由仓库根的 `pyproject.toml` + `uv` 管理（`requirements.txt` 只是可读清单，供 Docker 构建按行安装）：
 
 ```bash
-cd my_langchain_demo
 uv sync                                    # 或：.venv\Scripts\activate
 ```
 
 前端另装：
 
 ```bash
-cd advanced_tutorial/rag_qa_project/frontend
+cd frontend
 npm install
 ```
+
+> 下文命令一律以**项目根目录**为基准（独立仓库即仓库根；monorepo 布局下是
+> `advanced_tutorial/rag_qa_project/`）。
 
 ### 2. 入库（首次必跑）
 
 ```bash
-cd advanced_tutorial/rag_qa_project
 python ingest.py                # 幂等：库已存在则跳过
 python ingest.py --force        # 重建：先删 collection 再重新嵌入
 ```
@@ -186,18 +257,18 @@ python ingest.py --force        # 重建：先删 collection 再重新嵌入
 ### 3. 起后端
 
 ```bash
-cd advanced_tutorial/rag_qa_project        # ← 必须在这个目录下启动，见「开发约定 §1」
 python -m uvicorn backend.app.api.main:app --port 8000 --reload
+# ← 必须把「项目根目录」当工作目录启动，见「开发约定 §1」
 ```
 
 自检（实测输出）：
 
 ```bash
 curl -s http://127.0.0.1:8000/api/health
-# {"status":"ok","kb_count":2885,"model":"qwen3.7-text-embedding"}
+# {"status":"ok","kb_count":3755,"model":"qwen3.7-text-embedding"}
 
 curl -s http://127.0.0.1:8000/api/kb/documents
-# {"documents":[],"builtin":{"docs":88,"chunks":2885}}
+# {"documents":[],"builtin":{"docs":88,"chunks":2885}}   ← 需带 Authorization 头，见契约文档
 ```
 
 交互式文档：<http://127.0.0.1:8000/docs>
@@ -205,13 +276,13 @@ curl -s http://127.0.0.1:8000/api/kb/documents
 ### 4. 起前端
 
 ```bash
-cd advanced_tutorial/rag_qa_project/frontend
+cd frontend
 npm run dev                     # http://localhost:5173
 ```
 
 Vite 已配好 proxy，把 `/api` 转发到 `:8000`，所以前端代码里一律用相对路径，不存在 CORS 问题。
 
-**后端还没写好时**，可以用 mock 顶替（同样监听 `:8000`，实现全部 6 个端点）：
+**后端还没写好时**，可以用 mock 顶替（同样监听 `:8000`，实现全部 12 个端点）：
 
 ```bash
 npm run mock
@@ -222,7 +293,6 @@ npm run mock
 不想手工配 MySQL / Redis 时，一条命令起全栈（MySQL + Redis + 后端 + 前端 nginx）：
 
 ```bash
-cd advanced_tutorial/rag_qa_project
 cp .env.example .env        # 填 DEEPSEEK_API_KEY / DASHSCOPE_API_KEY / RAGQA_JWT_SECRET
 docker compose up -d --build
 # 打开 http://localhost:8080（/docs 也经 nginx 反代可看）
@@ -258,14 +328,25 @@ python run.py "如何构建 RAG agent？" --debug                # 调试：打�
 
 ## HTTP 接口
 
-| 方法 | 路径 | 用途 | 响应 |
-|---|---|---|---|
-| `POST` | `/api/chat/stream` | 提问并流式作答 | `text/event-stream` |
-| `GET` | `/api/chat/history?thread_id=` | 拉取会话历史（checkpointer 是真相源） | `application/json` |
-| `POST` | `/api/kb/documents` | 上传文档并入库（SSE 进度） | `text/event-stream` |
-| `GET` | `/api/kb/documents` | 列出用户上传的文档 | `application/json` |
-| `DELETE` | `/api/kb/documents/{doc_id}` | 删除上传文档的全部向量块 | `application/json` |
-| `GET` | `/api/health` | 健康检查 / 就绪探针 | `application/json` |
+**共 12 个端点**（完整契约见 [`docs/api/README.md`](docs/api/README.md)）：
+
+| 方法 | 路径 | 用途 | 需登录 | 响应 |
+|---|---|---|---|---|
+| `POST` | `/api/auth/register` | 注册 | — | `application/json` |
+| `POST` | `/api/auth/login` | 登录，换取 JWT | — | `application/json` |
+| `GET` | `/api/auth/me` | 当前登录用户 | ✅ | `application/json` |
+| `POST` | `/api/chat/stream` | 提问并流式作答 | ✅ | `text/event-stream` |
+| `GET` | `/api/chat/history?thread_id=` | 拉取会话历史（checkpointer 是真相源） | ✅ | `application/json` |
+| `GET` | `/api/chat/threads` | 列出本人会话（倒序，最多 50 条） | ✅ | `application/json` |
+| `PATCH` | `/api/chat/threads/{thread_id}` | 重命名会话 | ✅ | `application/json` |
+| `DELETE` | `/api/chat/threads/{thread_id}` | 删除会话的全部服务端状态（幂等） | ✅ | `application/json` |
+| `POST` | `/api/kb/documents` | 上传文档并入库（SSE 进度） | ✅ | `text/event-stream` |
+| `GET` | `/api/kb/documents` | 列出本人上传的文档 | ✅ | `application/json` |
+| `DELETE` | `/api/kb/documents/{doc_id}` | 删除上传文档的全部向量块 | ✅ | `application/json` |
+| `GET` | `/api/health` | 健康检查 / 就绪探针 | — | `application/json` |
+
+> 「需登录」= 必须带 `Authorization: Bearer <access_token>`，缺失 / 过期 / 被篡改一律 `401`。
+> `/api/health` 保持公开 —— 网关与容器健康检查不会带 token。
 
 ### SSE 事件
 
@@ -452,15 +533,21 @@ python scripts/migrate_kb_user_id.py --dry-run   # 再跑应为 0 段待迁移�
 ## 测试
 
 ```bash
-cd advanced_tutorial/rag_qa_project
-python -m pytest tests -v          # 25 passed（11 个工作流 + 14 个上传链路），约 6 秒
+python -m pytest tests -v          # 257 passed, 1 skipped, 4 deselected，约 20 秒
 ```
 
 ```bash
 cd frontend
-npm run test                       # 55 passed（7 个文件，jsdom），约 4 秒
-npm run build                      # tsc --noEmit + vite build，产物 ~497 KB JS（gzip 155 KB）
+npm run test                       # 148 passed（14 个文件，jsdom），约 4 秒
+npm run build                      # tsc --noEmit + vite build（类型检查不过就不出包）
 ```
+
+> **那 1 个 skip 是有意为之，不是掩盖失败**：`test_auth_service.py:93` 依赖 MySQL 的
+> `utf8mb4_0900_ai_ci` 排序规则，而 SQLite 默认大小写敏感，该行为在本地替身上不成立 —— 它留给
+> 手工验收，理由写在 skip reason 里。4 个 deselected 是 `pytest.ini` 的 `addopts = -m "not redis"`
+> 排除的 Redis 连通性自检（需要真实 Redis，用 `python -m pytest -m redis` 手动触发）。
+> 这与本项目的测试纪律一致：**需要真实服务的用例必须显式排除，而不是靠 skip** ——
+> skip 会让「配了却连不上」这种最该告警的状态悄悄变绿。
 
 两个测试文件都是**完全离线**的，靠依赖注入把外部服务换掉：
 
@@ -506,7 +593,8 @@ IDE 会把三个根都当解析路径，于是裸写法**在编辑器里不报�
   一份代码写进去的向量另一份的 retriever 看不见（症状：上传成功但搜不到）
 - 模块级状态双份 → `monkeypatch` 只打中一半，测试假绿/假红
 
-请只保留 `advanced_tutorial/rag_qa_project` 一个 Sources Root。
+**请只把项目根目录标成一个 Sources Root** —— 独立仓库就是仓库根；monorepo 布局下是
+`advanced_tutorial/rag_qa_project/`。多标一个根就会复现上面两个症状。
 
 ### 2. 同步阻塞活儿一律丢 `asyncio.to_thread`
 
@@ -555,9 +643,9 @@ f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"   # 空行�
 4. **LangSmith 追踪**：`.env` 里 `LANGSMITH_TRACING=true`，每次运行自动上报，
    可在 <https://smith.langchain.com> 查看完整调用树、token 消耗与每个节点的输入输出。
 5. **前端 mock**：`npm run mock` 起一个假后端，把前后端联调和后端开发解耦。
-6. **教学 demo**：`backend/_sse_upload_demo.py` 是不依赖 LangChain/Chroma 的最小 SSE 上传实现，
-   专门用来观察「客户端中断时异步生成器到底收到哪个异常」：
-   `python -m uvicorn backend._sse_upload_demo:app --port 8010`
+6. **教学 demo**：`docs/examples/sse_upload_demo.py` 是不依赖 LangChain/Chroma 的最小 SSE 上传实现，
+   专门用来观察「客户端中断时异步生成器到底收到哪个异常」（`asyncio.CancelledError`，**不是** `GeneratorExit`）。
+   在 `docs/examples/` 目录下跑：`python -m uvicorn sse_upload_demo:app --port 8010`
 
 ---
 
@@ -580,40 +668,129 @@ f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"   # 空行�
 用 `curl /api/health` 看 `kb_count` 有没有涨，再用 `GET /api/kb/documents` 确认 `origin=upload` 的块在不在。
 
 **Q5：怎么不花 API 额度做回归测试？**
-见「测试」一节。`build_graph(model=..., retriever=...)` 和 `monkeypatch function_tools.get_vectorstore`
-是两个注入点，25 个后端用例全部离线跑通。
+见「测试」一节。两个注入点是 `build_graph(model=..., vectorstore=..., checkpointer=...)`
+和 `monkeypatch backend.tools.upload_function_tools.get_vectorstore`，
+262 个后端用例（257 通过 + 1 有意 skip + 4 在线用例排除）全部离线跑通。
 
 **Q6：换其他 LLM / 其他向量库？**
-`graph.py` 的 `get_model()` / `get_vectorstore()` / `get_retriever()` 是仅有的三处基础设施绑定，替换它们即可。
+`graph.py` 的 `get_model()` / `get_vectorstore()` 是仅有的两处基础设施绑定，替换它们即可
+（`retrieve` 节点直接调 `vectorstore.similarity_search(query, k=, filter=)`，
+所以换向量库时**必须支持 `filter` 参数** —— 租户隔离靠的就是它）。
 
-**Q7：`data/knowledge.json` 是什么？**
-早期「公司制度问答」版本的遗留示例数据，**当前代码没有任何地方引用它**，可以忽略或删除。
+**Q7：上传件对别人可见吗？**
+不可见。检索范围是 `{"$or":[{"kb":"langchain_docs"},{"user_id":<自己>}]}` ——
+预置的 88 篇官方文档全局共享，上传件仅本人可见（检索 / 列表 / 删除 / 同名替换四处统一过滤）。
+P3 之前的旧上传件没有 `user_id`，必须先用 `scripts/migrate_kb_user_id.py` 补迁移。
 
 ---
 
 ## 已知问题
 
-以下是实测发现、尚未修复的：
+### 已修复（留档，因为排查过程本身有价值）
 
-1. **兜底分支不产生 `token` 帧。** `graph.py` 的 `generate` 节点在 `documents` 为空时直接
-   `return {"generation": "知识库中未找到…"}`，**没有调用 model**，因此 `stream_mode="messages"`
-   一个 token 都不推。前端收到「8 个 step + 空 sources + done」，答案气泡是空白的，
-   而不是显示那句兜底提示。
-   实测事件序列：`['step']×8 → 'sources' → 'done'`，`token` 帧数 = 0。
-   修法：兜底分支也走一次 model（或让 `chat_service` 在 `done` 前补发一帧 `token`）。
+**① 兜底分支不产生 `token` 帧** —— ✅ 已修。
 
-2. **检索召回质量偏低。** 问「RecursiveCharacterTextSplitter 怎么切分 markdown」时，
-   `top_k=4` 命中的全是 *Build a semantic search engine* / *Build a custom RAG agent* 这类教程页，
-   grade 连续三轮判 0/4 相关，重写耗尽后走兜底。
-   可调方向：加大 `top_k`、给检索器加重排序（MMR / rerank）、或检查嵌入模型对代码类术语的表现。
+- **症状**：未命中知识库时前端答案气泡**完全空白**。实测事件序列 `['step']×8 → 'sources' → 'done'`，
+  `token` 帧数 = 0。
+- **根因**：`generate` 节点在 `documents` 为空时直接 `return {"generation": "知识库中未找到…"}`，
+  **没有调用 model**，于是 `stream_mode="messages"` 一个 `AIMessageChunk` 都推不出来。
+- **修法（双保险）**：① `graph.py` 的 `_answer_without_kb` 改为真调 model 用自有知识作答
+  并自声明未经验证；② `chat_service.py` 再加一层 —— 全程没推过任何 token 却拿到了 `generation`，
+  就在 `done` 之前补发 `step(generate)` + 一帧 `token`，保证事件序恒为 `…step → token → sources → done`。
+- **回归线**：`tests/test_chat_stream.py::test_fallback_path_emits_token_frame_and_marks_ungrounded`
+  把这行为钉死了；`graph.py:266-273` 记录了「为什么不拆成两个 LangGraph 节点」
+  （`chat_service` 靠 `meta["langgraph_node"] == "generate"` 过滤 token，拆节点会把兜底路径的 token 整条丢掉）。
+
+### 未修复
+
+**② 离线指标与线上体验脱节**（本项目最值得说的一处）。
+
+- **现象**：`eval_retrieval.py` 在 23 条标注 query 上跑出 **dense recall@5 = 100%、MRR 0.978、hit@1 95.7%**，
+  看起来检索毫无问题。但线上问「RecursiveCharacterTextSplitter 怎么切分 markdown」时，
+  `top_k=4` 命中的全是 *Build a semantic search engine* 这类教程页，`grade` 连续三轮判 0/4 相关，
+  重写耗尽后走兜底。
+- **根因有两层**：
+  1. **口径不一致**：评测判定是**文档级**的（`is_hit`：top-k 里任一段来自 `expected_sources` 之一即算命中），
+     而线上 `grade_documents` 是**段级**的（LLM 逐段判断这段能不能回答问题）。
+     「命中文档 X」不等于「命中的那一段有用」—— 命中的是教程页里顺带提到 splitter 的段落，
+     grade 判 False 其实是**正确的**。
+  2. **评测集有选择偏差**：23 条 query 分布为 `term_en 8 / semantic_zh 8 / upload_zh 7`，
+     而 `term_en` 全是 LangGraph 核心 API 名、`semantic_zh` 全是 LangGraph 概念 ——
+     **恰好都是「术语可精确匹配、文档主题明确」的简单 query**，没有一条是「概念分散在多个教程页、
+     需要跨文档综合」的困难 query，而线上翻车的正是这种。
+- **改进方向**（注意：**不是**「上更高级的检索」）：
+  - 评测集补困难样本 + 加 `expected_keywords` 做**段级判定**，让口径与线上一致；
+  - 新增**端到端指标**：兜底率、平均重写次数、首 token 延迟（TTFT）—— 文档级 recall 100% 却答不出来，
+    说明缺的正是 e2e 指标；
+  - 在评测数据支撑下再调 `grade_strict` / `top_k`。
+
+> **为什么不上 hybrid 检索**：`data/eval_results.json` 实测 hybrid（RRF 0.6/0.4）相对 dense
+> **recall 零增益**（都是 100%），却把 **hit@1 从 95.7% 打到 60.9%**、MRR 从 0.978 打到 0.771
+> （原因是 RRF 对重复内容累加计分，重复 chunk 被顶到前面）。
+> 所以「不引入 BM25」是数据驱动的决策，而不是偷懒 —— 详见下方「检索评估」。
 
 ---
 
-## 与教程的关系
+## 检索评估
 
-本项目是 `advanced_tutorial/` 模块 2 的实践载体：
+检索要不要加东西，**由数据决定，而不是由「看起来更高级」决定**。`eval_retrieval.py` 提供四配置离线对照：
 
-- 模块 1（`01`–`03` notebook）讲解其中用到的 LangChain / LangGraph 核心概念
-- 模块 3（`04`–`05` notebook）深入本项目用到的流式输出、回调、自定义工具与错误处理
-- 模块 4（`06` notebook）以本项目为例讲解模块化、配置、测试与性能的工程化最佳实践
-- `10_RAG进阶检索三件套.ipynb` 对应本项目的检索质量优化方向（见「已知问题 §2」）
+```bash
+uv run python eval_retrieval.py                    # 单组权重 0.6,0.4 + 云端精排
+uv run python eval_retrieval.py --sweep            # 扫六组 RRF 权重，再按最优权重精排
+uv run python eval_retrieval.py --quick            # 只跑前 3 条（冒烟）
+uv run python eval_retrieval.py --no-rerank        # 跳过精排（零 rerank API 调用）
+uv run python eval_retrieval.py --detail           # 打印每条 query 的各配置 top-5
+```
+
+**实测结果**（`data/eval_results.json`，23 条标注 query，k=20 → top_n=5，语料 3755 段）：
+
+| 配置 | recall@5 | MRR | hit@1 | p50 | p95 |
+|---|---|---|---|---|---|
+| **dense**（线上基线） | **100.0%** | **0.978** | **95.7%** | 338ms | 465ms |
+| bm25 | 69.6% | 0.588 | 52.2% | 11ms | 16ms |
+| hybrid（RRF 0.6/0.4） | 100.0% | 0.771 | 60.9% | 351ms | 546ms |
+| hybrid_rerank | 见 `--sweep` 输出 | — | — | — | — |
+
+**结论：不引入 hybrid 检索。** 理由是实打实的两个数字 —— 相对 dense，hybrid 的
+**recall 零增益**（都是 100%，即融合没有救回任何一条 dense 漏掉的），
+却把 **hit@1 从 95.7% 打到 60.9%**、MRR 从 0.978 打到 0.771。
+
+原因写在脚本注释里：RRF 对**重复内容累加计分**（官方 `EnsembleRetriever` 源码原文
+`"Duplicated contents across retrievers are collapsed & scored cumulatively"`），
+语料里的重复 chunk 一旦被同一路检索多次召回就会叠加分数、挤掉真正的最优项。
+
+> ⚠ **这张表有一个必须说明的局限**（面试被追问时的关键）：评测判定是**文档级**的
+> （top-k 里任一段来自 `expected_sources` 之一即算命中），而线上 `grade_documents` 是**段级**的。
+> 所以这里的 `recall = 100%` **不代表线上体验好** —— 详见「已知问题 ②」。
+> 这也说明：**指标口径设计错了，100% 的指标反而是有害的**，它会掩盖真问题。
+
+BM25 索引的两个真实成本（冷启动时打印）：全量建索引约 2.2s、常驻几十 MB，
+且它是**静态快照** —— 知识库上传后必须 `cache_clear()` 重建，否则新文档在稀疏检索里不可见。
+
+---
+
+## 演进路线（P1 → P4）
+
+每一期解决一个具体问题，`docs/superpowers/specs/` 与 `plans/` 里有对应的设计文档与实施计划（各 6–7 篇）：
+
+| 期 | 主题 | 解决的问题 | 关键设计 |
+|---|---|---|---|
+| **P1** | CRAG 工作流 + SSE + 前端 | 从「能问答」到「能流式看到推理过程」 | 双 `stream_mode`；只放行 `generate` 节点的 token |
+| **P2** | 账号体系 | 没有用户，数据无法归属 | JWT（HS256）+ bcrypt；`RAGQA_JWT_SECRET` 启动期校验 |
+| **P3** | 会话列表 + 知识库隔离 | 上传件对所有人可见（数据泄露级缺陷） | `user_id` 写进每段 metadata；`404 vs 403` 按「是否泄露存在性」分别选择 |
+| **P4** | Redis 缓存 + 事件流 | 把 cache-aside / MQ 派生数据的模式走通 | 写时删键 + 短 TTL 兜底 + 全部调用在降级逻辑之内；消费组 + `event_id` 幂等 + 死信 |
+
+> **P4 的诚实声明**：本期**不带来性能收益**（实测收益 ≈ 0）。它的价值是把
+> 「cache-aside + 失效 + 降级 + MQ 派生数据」这套模式在真实代码里走通，
+> 为将来真正的热点（检索侧 dense p50 338ms）备好可复用的工具与降级习惯。
+> 将来评估「缓存到底有没有用」的判据应是**命中率与 MySQL 查询计数**，而不是延迟。
+
+---
+
+## 与上游教程的关系
+
+本项目最初是 `advanced_tutorial/` 教程的实践载体（模块 2），现已是**独立可运行的完整项目**：
+不依赖任何 notebook，`uv sync` + `python ingest.py` + 起服务即可运行。
+
+教程 notebook（`01`–`06`、`10_RAG进阶检索三件套.ipynb`）仍在原仓库中，但**本项目不 import 它们**。

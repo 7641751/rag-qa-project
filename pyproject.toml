@@ -1,0 +1,60 @@
+# rag_qa_project 依赖声明（独立仓库）
+#
+# 背景：本项目原先住在 monorepo（my_langchain_demo/advanced_tutorial/rag_qa_project）里，
+# 依赖声明在**仓库根**的 pyproject.toml —— 抽成独立仓库时它不会被带出来，所以在这里补一份。
+#
+# 用法：
+#     uv sync                    # 首次会生成 uv.lock（未入库，按需提交）
+#     uv run python run.py "..." # 不必手动 activate
+#
+# requirements.txt 与这份文件是**双份声明**：前者供 Docker 构建按行安装（Dockerfile 会用
+# grep 剔除两个仅在本地嵌入时才需要的重依赖），后者是 uv / 本地开发的正规入口。
+# 改依赖时**两份都要改** —— 这是已知的重复，见 README「P2-2 依赖清单统一」。
+[project]
+name = "rag-qa-project"
+version = "0.1.0"
+description = "基于 CRAG 的 LangChain/LangGraph 文档智能问答系统（LangGraph + FastAPI + React）"
+requires-python = ">=3.14"
+dependencies = [
+    "aiomysql>=0.3.2",
+    "aiosqlite>=0.22.1",
+    "asyncpg>=0.31.0",
+    "bcrypt>=5.0.0",
+    "chromadb>=0.5.0",
+    "cryptography>=50.0.0",
+    "dashscope>=1.26.7",
+    "faiss-cpu>=1.7.0",
+    "fastapi[standard]>=0.141.1",
+    "grandalf>=0.8",
+    "jieba>=0.42.1",
+    "langchain>=0.3.0",
+    "langchain-chroma>=0.2.0",
+    "langchain-community>=0.3.0",
+    "langchain-core>=1.5.3",
+    "langchain-deepseek>=1.1.0",
+    "langgraph>=1.2.10",
+    "langgraph-checkpoint-sqlite>=3.1.1",
+    "pydantic>=2.13.4",
+    "pydantic-settings>=2.15.0",
+    "pyjwt>=2.13.0",
+    "pypdf>=6.18.1",
+    "python-dotenv>=1.2.2",
+    "python-multipart>=0.0.32",
+    "rank-bm25>=0.2.2",
+    "redis[hiredis]>=8.1.0",
+    "sqlalchemy[asyncio]>=2.0.52",
+    "uvicorn[standard]>=0.52.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+]
+
+# ⚠ 刻意**没有**声明的两个依赖（原先被误列为正式依赖）：
+#   sentence-transformers / langchain-huggingface
+#   运行时代码从不 import 它们（嵌入走 DashScope 云端），却会拖入 torch/transformers
+#   （≈ +2GB 镜像、`uv sync` 显著变慢）。Dockerfile 里也是显式 grep 剔除这两个。
+#   它们只在「改用本地 HF 嵌入」的早期实验里用过，源码里只剩注释。
+#   真要恢复本地嵌入时再按需加回。

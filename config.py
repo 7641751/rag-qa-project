@@ -18,7 +18,38 @@ PROJECT_DIR = Path(__file__).resolve().parent
 # pydantic-settings 的 env_file 只喂给 Settings 模型，**不会写进 os.environ**，
 # 而 DashScopeEmbeddings / ChatDeepSeek 是用 os.getenv 取 key 的 ——
 # 少了这一句，直接跑 uvicorn 时嵌入和 LLM 都会因为拿不到 key 而失败。
-load_dotenv(PROJECT_DIR.parent.parent / ".env")   # 项目根 .env
+def _find_env_file() -> Path | None:
+    """定位 .env：**由外向内**逐级回退，找到第一个存在的就用。
+
+    为什么是「由外向内」而不是「就近优先」：monorepo 布局下同时存在两个用途不同的 .env ——
+      · `<monorepo 根>/.env`（两级之上）      本地开发用，含 RAGQA_MYSQL_DATABASE_URL / REDIS_URL
+      · `PROJECT_DIR/.env`（本项目根，就地）  docker compose 用，只有 MYSQL_PASSWORD / REDIS_PASSWORD
+    就近优先会让本地开发读到 docker 那份 —— 少了 mysql_database_url，启动期直接快速失败。
+    所以**外层的开发配置**优先级更高。
+
+    为什么必须逐级回退而不是写死一个：本项目已从 monorepo 抽成独立仓库，
+    此时 PROJECT_DIR 就是仓库根、`parent.parent` 会指到仓库外面去。
+    四个候选覆盖了全部已知布局：
+      ① RAGQA_ENV_FILE 显式指定（最高优先级，逃生舱）
+      ② PROJECT_DIR.parent.parent/.env   monorepo 布局（外层的开发配置）
+      ③ PROJECT_DIR.parent/.env          中间层
+      ④ PROJECT_DIR/.env                 独立仓库根 / docker 镜像内（PROJECT_DIR = /app）
+    找不到就返回 None —— 此时全靠进程环境变量（docker compose 就是这种注入方式）。
+    """
+    explicit = os.environ.get("RAGQA_ENV_FILE", "").strip()
+    if explicit:
+        return Path(explicit)
+    for candidate in (PROJECT_DIR.parent.parent / ".env",
+                      PROJECT_DIR.parent / ".env",
+                      PROJECT_DIR / ".env"):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+ENV_FILE = _find_env_file()
+if ENV_FILE is not None:
+    load_dotenv(ENV_FILE)
 # HF 镜像要赶在 huggingface_hub 被导入前设好，否则 ENDPOINT 会被固化成 huggingface.co
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
@@ -28,7 +59,7 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(
         env_prefix="RAGQA_",          # 环境变量前缀，避免与全局变量冲突
-        env_file=str(PROJECT_DIR.parent.parent / ".env"),  # 项目根 .env
+        env_file=str(ENV_FILE) if ENV_FILE else None,  # 与 load_dotenv 同一份，见 _find_env_file
         extra="ignore",
     )
 
@@ -37,8 +68,9 @@ class Settings(BaseSettings):
         secret = (self.jwt_secret or "").strip()
         if not secret:
             raise ValueError(
-                "RAGQA_JWT_SECRET 未设置。请在仓库根的 .env（rag_qa_project 的上一级）里加一行 "
-                "RAGQA_JWT_SECRET=<openssl rand -hex 32 的输出>")
+                f"RAGQA_JWT_SECRET 未设置。请在 .env 里加一行 "
+                f"RAGQA_JWT_SECRET=<openssl rand -hex 32 的输出>"
+                f"（当前加载的 .env：{ENV_FILE or '未找到 —— 请用 RAGQA_ENV_FILE 显式指定'}）")
         if len(secret.encode("utf-8")) < 32:
             # HS256 的 HMAC 密钥要 ≥ 32 字节，否则 PyJWT 会在每次 encode/decode
             # 发 InsecureKeyLengthWarning（RFC 7518 §3.2）。在启动期拦掉更省事。

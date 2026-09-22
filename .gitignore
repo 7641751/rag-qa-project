@@ -1,0 +1,93 @@
+# ============================================================
+# rag_qa_project/.gitignore
+#
+# ⚠ 本文件是**独立仓库**的 .gitignore。在 monorepo 布局下，仓根还有一份
+#   advanced_tutorial/.gitignore 同时生效；但抽成独立仓库后只有这一份，
+#   所以它必须自足 —— 尤其不能漏掉 .env（里面有 API key 与 JWT 密钥）。
+#
+# 原则：只排除「密钥 / 可重建的派生数据 / 第三方与个人隐私内容 / 工具缓存」。
+# ============================================================
+
+# ---------- 密钥（最重要的一条）----------
+# .env 由 config.py 的 _find_env_file() 由外向内查找；docker compose 也读项目根的 .env。
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.*
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+.coverage
+htmlcov/
+
+# ---------- Node / 前端 ----------
+node_modules/
+dist/
+npm-debug.log*
+yarn-error.log*
+*.local
+
+# ---------- 向量库与派生数据（可用 `python ingest.py --force` 重建）----------
+# 单文件 24MB+，进库会让仓库体积不可控
+data/chroma_db/
+data/faiss_index/
+*.faiss
+*.sqlite3
+index_metadata.pickle
+
+# LangGraph checkpointer 是运行时状态（含会话历史），且 SQLite 的 WAL 旁挂文件
+# 只要后端在跑就在变 —— 漏了它们 git status 会一直有噪音
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+
+# 检索评估：data/eval_queries.json 是人工标注的**源**，要进库；
+# 跑出来的 data/eval_results.json 与 _eval_* 冒烟产物是可重建的派生数据，不进库。
+data/eval_results.json
+data/_eval*
+
+# ---------- 用户上传的原件（个人笔记 / 课程资料）----------
+# 这是运行时数据而不是源码。注意它同时是向量库的**真相源**
+# （ingest.py --force 重建时靠它捞回用户文档），所以本地别删。
+data/uploads/
+
+# 删文档时给「只有向量、无落盘原件」的孤儿做过一次性备份（orphan-backup-*.json）
+data/orphan-backup-*.json
+
+# ---------- LLM / 工具缓存 ----------
+.llm_cache.db
+*.cache
+.cache/
+
+# ---------- IDE ----------
+.idea/
+.vscode/
+*.iml
+*.iws
+
+# ---------- 设计过程的中间产物（成品在 docs/superpowers/ 里，保留）----------
+.superpowers/
+
+# ---------- 工具误产的垃圾 ----------
+# 带随机时间戳后缀的依赖图，是 IDE/工具产物而非源码
+mermaid[0-9]*.mermaid
+0.1.0
+3.0.0
+
+# ---------- 系统 ----------
+.DS_Store
+Thumbs.db
+desktop.ini

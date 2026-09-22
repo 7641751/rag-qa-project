@@ -21,8 +21,8 @@
    工厂仍持有旧引擎」的半残状态。对称实现见 `graph.py` 的 `aclose_checkpointer()`。
 
 口令不进源码：连接串由 `config.settings.mysql_database_url` 提供，
-值来自 `rag_qa_project/` **上一级**的 `.env`（见 `config.py` 的 `PROJECT_DIR.parent.parent`，
-即 `my_langchain_demo/.env`）里的 `RAGQA_MYSQL_DATABASE_URL`；`.gitignore` 已覆盖 `.env`。
+值来自 `config._find_env_file()` 定位到的 `.env`（独立仓库即项目根的 `.env`；
+monorepo 布局下是上两级那一份）里的 `RAGQA_MYSQL_DATABASE_URL`；`.gitignore` 已覆盖 `.env`。
 """
 from collections.abc import AsyncGenerator
 from functools import lru_cache

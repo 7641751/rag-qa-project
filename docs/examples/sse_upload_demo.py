@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 """SSE 文件上传 · 最小可跑教程 demo（只依赖 fastapi + uvicorn，不碰 LangChain/Chroma）。
 
-跑起来（在 rag_qa_project 目录下）：
-    uv run python -m uvicorn backend._sse_upload_demo:app --port 8010
+⚠ 本文件是**教学/实验用途**，不属于生产链路 —— 所以它住在 docs/examples/ 而不是 backend/。
+   （原先放在 backend/ 顶层，容易被误读成生产代码。）
+
+跑起来（在**本目录**下执行，它不 import 项目里任何模块）：
+    uv run python -m uvicorn sse_upload_demo:app --port 8010
 
 演示 5 件事，对应 docs/api/README.md 的「知识库端点」章节：
   ① multipart 读文件 + **流开始前**校验（415/413/422 用 HTTP 状态码，不降级成 SSE error）
