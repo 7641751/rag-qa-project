@@ -53,10 +53,13 @@ def _parse_sse(frames: list[str]) -> list[tuple[str, dict]]:
 
 def _run_stream_with_vs(monkeypatch, relevance_mode: str,
                         question: str = "LangGraph 怎么做持久化？",
-                        user_id: int | None = None, docs=None):
+                        user_id: int | None = None, docs=None,
+                        redis=None, started_at: float | None = None):
     """同 _run_stream，但把**向量库替身也返回** —— 否则断言不了检索收到的 filter。
 
     `docs=[]` 用于构造「知识库为空」场景（新环境还没跑 ingest.py）。
+    `redis` / `started_at` 透传给 stream_chat（P4 Task 6 的 MQ 生产端入参），
+    两者都有默认值 —— 既有调用方一处都不用改。
     """
     vs = FakeVectorStore(docs=docs) if docs is not None else FakeVectorStore()
     app = build_graph(model=FakeRAGModel(responses=[], relevance_mode=relevance_mode),
@@ -65,7 +68,8 @@ def _run_stream_with_vs(monkeypatch, relevance_mode: str,
     req = ChatRequest(question=question, thread_id="t-stream")
 
     async def go():
-        return [frame async for frame in chat_service.stream_chat(req, user_id=user_id)]
+        return [frame async for frame in chat_service.stream_chat(
+            req, user_id=user_id, redis=redis, started_at=started_at)]
 
     return _parse_sse(asyncio.run(go())), vs
 

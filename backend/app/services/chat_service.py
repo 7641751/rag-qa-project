@@ -6,6 +6,8 @@ from langchain_core.messages import HumanMessage, AIMessage, AIMessageChunk
 from langchain_core.runnables import RunnableConfig
 import json
 import logging
+import time
+import uuid
 
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,7 +33,14 @@ LABELS = {"retrieve": "检索", "grade_documents": "评分",
 _REQUIRED_THREAD_FIELDS = ("thread_id", "title", "created_at", "updated_at")
 
 
-async def stream_chat(chat_request: ChatRequest, user_id: int | None = None):
+async def stream_chat(chat_request: ChatRequest, user_id: int | None = None,
+                      redis=None, started_at: float | None = None):
+    """问答 SSE 流。P4 新增两个**带默认值**的形参（既有调用方零破坏）：
+
+    · redis：MQ 生产端用的客户端；None（未配置 / 开关关闭）⇒ 不发事件，静默跳过。
+    · started_at：perf_counter 计时起点，由调用方在装配处取（便于测试注入 0.0）；
+      None ⇒ 事件里 latency_ms 记 0（计时缺失不算错，统计是可丢的派生数据）。
+    """
     graph = get_graph()
     # user_id 必须进 state：retrieve 节点靠它生成本轮检索的 filter（kb_filter，P3）。
     # 显式写入 None 而不是省略该键 —— 便于日后再排查「这次到底注入的是什么」，
@@ -83,6 +92,12 @@ async def stream_chat(chat_request: ChatRequest, user_id: int | None = None):
 
         yield sse("done", {"thread_id": chat_request.thread_id, "rewrites": rewrites,
                            "grounded": bool(final_docs)})
+        # 事件在生产端**只在问答成功后**发（设计文档 §4 顺序 3：MQ 事件的产生在业务
+        # 成功之后）；XADD 失败只记 warning —— 统计是可丢的派生数据，把成功回答
+        # 变成 error 帧是最糟结局。_emit_qa_event 内部整体兜异常，见其 docstring。
+        await _emit_qa_event(redis, user_id=user_id, thread_id=chat_request.thread_id,
+                             rewrites=rewrites, grounded=bool(final_docs),
+                             started_at=started_at)
     except RetrievalError as exc:
         # 检索层失败 ≠ LLM 失败。两者都报 LLM_ERROR 会把排查方向带偏 ——
         # 用户看到「LLM 错误」会去查模型与额度，而真正坏的是向量库。
@@ -90,6 +105,32 @@ async def stream_chat(chat_request: ChatRequest, user_id: int | None = None):
         yield sse("error", {"code": "INTERNAL_ERROR", "message": f"检索失败：{exc}"})
     except Exception as exc:
         yield sse("error", {"code": "LLM_ERROR", "message": f"{type(exc).__name__}: {exc}"})
+
+
+async def _emit_qa_event(redis, *, user_id, thread_id, rewrites, grounded,
+                         started_at) -> None:
+    """把本轮问答的结果写进 Redis Stream（派生数据，可丢）。
+
+    ⚠ 这里**不能抛异常**：它在 SSE 流的收尾处，抛出去会把已经成功的回答变成 error 帧
+    （对统计而言，少一条记录的代价可以忽略）。
+    """
+    if redis is None:
+        return
+    # `is not None` 而非真值判断：started_at=0.0 是合法起点（测试正是注入 0.0 来断言
+    # 耗时为正），真值写法会把 0.0 误判成「没有计时」而记 0。
+    latency_ms = (int((time.perf_counter() - started_at) * 1000)
+                  if started_at is not None else 0)
+    try:
+        await redis.xadd(
+            settings.qa_stream_key,
+            # fields 必须全是 str：Redis 协议没有数值类型，靠消费端自行解析。
+            {"event_id": str(uuid.uuid4()), "user_id": str(user_id),
+             "thread_id": thread_id, "rewrites": str(rewrites),
+             "grounded": "1" if grounded else "0", "latency_ms": str(latency_ms)},
+            # MAXLEN 必须带：否则流无限增长，最终拖垮 Redis 内存。
+            maxlen=10000, approximate=True)
+    except Exception as exc:
+        logger.warning("[qa-event] 写入事件流失败（不影响问答）：%s", exc)
 
 
 def sse(event: str, data: dict) -> str:
