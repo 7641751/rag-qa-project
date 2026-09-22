@@ -47,6 +47,9 @@ services:
   backend:
     build:
       context: .
+      args:
+        # 国内云服务器构建慢时，在 .env 里打开 PIP_INDEX_URL（见 .env.example）
+        PIP_INDEX_URL: "${PIP_INDEX_URL:-https://pypi.org/simple}"
     environment:
       # 容器网络内地址（覆盖开发机的本机 / VM 地址）
       RAGQA_MYSQL_DATABASE_URL: "mysql+aiomysql://ragqa:${MYSQL_PASSWORD:-ragqa_pw}@mysql:3306/ragqa?charset=utf8mb4"
@@ -80,6 +83,9 @@ services:
   frontend:
     build:
       context: ./frontend
+      args:
+        # 国内云服务器构建慢时，在 .env 里打开 NPM_REGISTRY（见 .env.example）
+        NPM_REGISTRY: "${NPM_REGISTRY:-https://registry.npmjs.org}"
     ports:
       - "8080:80"
     depends_on:

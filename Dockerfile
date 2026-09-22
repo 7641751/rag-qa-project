@@ -9,12 +9,15 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # 1) 先装依赖（独立层：改业务代码不必重装依赖）
+#    PIP_INDEX_URL 可选换源：云服务器在国内时指向阿里云镜像会显著提速
+#    （由 docker-compose 的 build.args 传入；默认官方源）
+ARG PIP_INDEX_URL=https://pypi.org/simple
 COPY requirements.txt .
 # ⚠ 构建时剔除两行「本地 HF 嵌入」依赖（sentence-transformers / langchain-huggingface）：
 #   运行时代码从不 import 它们（嵌入走 DashScope 云端，源码里只剩历史注释），
 #   但它们会拖入 torch/transformers（≈ +2GB 镜像、拉取与构建显著变慢），对运行零价值。
 RUN grep -vE '^(sentence-transformers|langchain-huggingface)' requirements.txt > /tmp/reqs.txt \
- && pip install -r /tmp/reqs.txt
+ && pip install --index-url "${PIP_INDEX_URL}" -r /tmp/reqs.txt
 
 # 2) 再拷代码（.dockerignore 已排除 data/ frontend/ tests/ docs/ .env 等非运行必需物）
 COPY . .
