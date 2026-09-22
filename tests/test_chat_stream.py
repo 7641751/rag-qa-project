@@ -51,6 +51,26 @@ def _parse_sse(frames: list[str]) -> list[tuple[str, dict]]:
     return out
 
 
+def _open_stream_with_vs(monkeypatch, relevance_mode: str,
+                         question: str = "LangGraph 怎么做持久化？",
+                         user_id: int | None = None, docs=None,
+                         redis=None, started_at: float | None = None):
+    """同 _run_stream_with_vs，但返回**未消费的生成器**（不做 asyncio.run）。
+
+    为什么需要一个不消费的版本：一次性 list 消费只看得到终态，看不到
+    「某一帧吐出的**那一刻**」世界长什么样 —— P4 Task 6 复审的
+    test_event_comes_after_the_done_frame 正靠它断言「done 帧吐出时 XADD
+    尚未被调用」（顺序语义；把事件挪到 done 之前不会改变帧序，只能这样钉住）。
+    """
+    vs = FakeVectorStore(docs=docs) if docs is not None else FakeVectorStore()
+    app = build_graph(model=FakeRAGModel(responses=[], relevance_mode=relevance_mode),
+                      vectorstore=vs, checkpointer=InMemorySaver())
+    monkeypatch.setattr(chat_service, "get_graph", lambda: app)
+    req = ChatRequest(question=question, thread_id="t-stream")
+    return chat_service.stream_chat(req, user_id=user_id, redis=redis,
+                                    started_at=started_at), vs
+
+
 def _run_stream_with_vs(monkeypatch, relevance_mode: str,
                         question: str = "LangGraph 怎么做持久化？",
                         user_id: int | None = None, docs=None,
@@ -61,15 +81,12 @@ def _run_stream_with_vs(monkeypatch, relevance_mode: str,
     `redis` / `started_at` 透传给 stream_chat（P4 Task 6 的 MQ 生产端入参），
     两者都有默认值 —— 既有调用方一处都不用改。
     """
-    vs = FakeVectorStore(docs=docs) if docs is not None else FakeVectorStore()
-    app = build_graph(model=FakeRAGModel(responses=[], relevance_mode=relevance_mode),
-                      vectorstore=vs, checkpointer=InMemorySaver())
-    monkeypatch.setattr(chat_service, "get_graph", lambda: app)
-    req = ChatRequest(question=question, thread_id="t-stream")
+    gen, vs = _open_stream_with_vs(monkeypatch, relevance_mode, question=question,
+                                   user_id=user_id, docs=docs,
+                                   redis=redis, started_at=started_at)
 
     async def go():
-        return [frame async for frame in chat_service.stream_chat(
-            req, user_id=user_id, redis=redis, started_at=started_at)]
+        return [frame async for frame in gen]
 
     return _parse_sse(asyncio.run(go())), vs
 
