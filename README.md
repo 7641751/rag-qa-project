@@ -373,6 +373,36 @@ python scripts/migrate_kb_user_id.py --dry-run   # 再跑应为 0 段待迁移�
 
 ---
 
+## 缓存与事件流（P4）
+
+**三点定位（比实现更重要）**：
+
+- **缓存是可丢的派生数据，MySQL 才是真相源**：任何 Redis 故障都必须降级回源，
+  不得升级为业务故障（写时删键 + 短 TTL 兜底 + 缓存层全部调用都在降级逻辑之内）。
+- **授权永不走缓存**：归属校验只读 MySQL；命中缓存的响应在返回前另有归属/结构
+  两层自校验（键串了或载荷坏了一律当 miss、并删掉坏键）。
+- **事件流只用于统计**：问答成功后 `XADD`（失败只记 warning，绝不影响 SSE 流）→
+  消费端落 `qa_events` 表；消费端挂了不影响任何请求，至少一次投递靠 `event_id`
+  唯一键做幂等，超过重试上限进死信流（`…:dead`）而不是无限重投。
+
+**回滚开关**：`RAGQA_REDIS_CACHE_ENABLED=false` 一键回到「无缓存」行为（与 P3 逐字一致）；
+`.env` 未配 Redis 时同样整体旁路 —— Redis 是可选依赖，缺它不拦启动。
+
+**键与流**（完整设计见 [`docs/superpowers/specs/2026-09-21-redis-cache-and-mq-design.md`](docs/superpowers/specs/2026-09-21-redis-cache-and-mq-design.md)）：
+
+| 键 | 类型 | 用途 | TTL |
+|---|---|---|---|
+| `ragqa:conv:list:v1:{user_id}` | String(JSON) | 会话列表读缓存（三处写路径 commit 后删键） | 60s（仅兜底） |
+| `ragqa:stream:qa_stats` | Stream | 问答事件（`MAXLEN ~ 10000`） | 无 |
+| `ragqa:stream:qa_stats:dead` | Stream | 重试仍失败的死信（`MAXLEN ~ 1000`） | 无 |
+
+**诚实声明：本期不带来性能收益**（实测收益 ≈ 0）。它的价值是把「cache-aside + 失效 +
+降级 + MQ 派生数据」这套模式在真实代码里走通、为将来真正的热点（检索侧，dense p50 197ms）
+备好可复用的工具与降级习惯；将来评估「缓存到底有没有用」的判据应是**命中率与 MySQL
+查询计数**，而不是延迟。
+
+---
+
 ## 配置项
 
 全部集中在 [`config.py`](config.py)，可用 `RAGQA_` 前缀的环境变量覆盖：
@@ -392,6 +422,10 @@ python scripts/migrate_kb_user_id.py --dry-run   # 再跑应为 0 段待迁移�
 | `uploads_dir` | `data/uploads` | `RAGQA_UPLOADS_DIR` | 用户上传原件落盘处 |
 | `mysql_database_url` | `""`（未配置） | `RAGQA_MYSQL_DATABASE_URL` | MySQL 异步连接串（P2 账号体系用）。默认空串 → 构造引擎前快速失败并点名该变量；**口令只放 .env，不进源码** |
 | `sql_echo` | `False` | `RAGQA_SQL_ECHO` | 是否打印全部 SQL。SSE 场景下默认关，否则 SQL 日志会淹没应用日志 |
+| `redis_url` | `""`（未配置） | `RAGQA_REDIS_URL` / `REDIS_URL` | 读缓存 + 问答事件流（P4）。**可选依赖**：未配置即整体旁路（行为同 P3）；`.env` 里现用裸 `REDIS_URL` |
+| `redis_cache_enabled` | `True` | `RAGQA_REDIS_CACHE_ENABLED` | 一键回滚开关：`false` ⇒ 完全不碰 Redis |
+| `conv_cache_ttl` | `60` | `RAGQA_CONV_CACHE_TTL` | 列表缓存 TTL 秒；只作兜底（主策略是写时删键） |
+| `qa_stream_key` | `ragqa:stream:qa_stats` | `RAGQA_QA_STREAM_KEY` | 问答统计事件流键名 |
 
 例：`RAGQA_TOP_K=6 python run.py "年假有几天？"`
 
