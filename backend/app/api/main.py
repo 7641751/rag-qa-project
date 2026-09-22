@@ -29,11 +29,13 @@ async def lifespan(_: FastAPI):
     # 起不来/挂掉都不影响任何业务请求（失败由它自己吞、只记日志）。
     consumer_task = None
     if app.state.redis_pool is not None:
-        from backend.app.services.qa_event_consumer import consume
+        from backend.app.services.qa_event_consumer import consume, log_consumer_crash
         from backend.tools.mysql_db_tools import get_db_session_maker
         consumer_task = asyncio.create_task(
             consume(aioredis.Redis(connection_pool=app.state.redis_pool),
                     get_db_session_maker()))
+        # 意外崩溃要立刻可见：任务异常无人取时直到 GC 才可能出声，与正常关闭无从区分。
+        consumer_task.add_done_callback(log_consumer_crash)
     yield
     # 先停消费端、再关池（它在用池）—— 既有清理顺序（池 → 引擎 → checkpointer）不动。
     if consumer_task is not None:

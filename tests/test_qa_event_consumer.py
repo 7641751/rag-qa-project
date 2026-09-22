@@ -7,6 +7,7 @@ FakeRedis 的 PEL 语义按**真实 Redis** 建模（交付即进 pending、只�
 重试/死信用例会变成假的绿（原计划的替身与实现叠加恰好构成这种不可达，见提交说明）。
 """
 import asyncio
+import logging
 import sys
 from contextlib import suppress
 from pathlib import Path
@@ -23,9 +24,14 @@ from backend.app.services import qa_event_consumer as consumer
 
 
 @pytest.fixture
-def maker():
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:", poolclass=StaticPool,
-                                 connect_args={"check_same_thread": False})
+def maker(tmp_path):
+    # ⚠ 用**文件库**而不是 :memory:：本文件的用例会在多个 asyncio.run（多个 event loop）
+    # 之间复用同一引擎，且 cancel 可能打断 aiosqlite 的在途操作、使物理连接被重建 ——
+    # 内存库的「新连接 = 空库」会让重建后查不到表（实测偶发 no such table，6/10 次）。
+    # 文件库下重连看到的还是同一个库，与 event loop 怎么切无关。
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path.as_posix()}/test.db",
+        poolclass=StaticPool, connect_args={"check_same_thread": False})
 
     async def _setup():
         async with engine.begin() as conn:
@@ -159,3 +165,67 @@ def test_consumer_loop_retries_then_dead_letters(maker):
     assert redis.dead, "超过 max_retries 必须进死信流"
     assert redis.dead[0][0].endswith(":dead")
     assert redis.acked == ["1-0"], "只有进死信时才 ACK 原事件（不无限重投）"
+
+
+def test_xack_failure_does_not_kill_consumer(maker):
+    """★ XACK 失败（Redis 瞬时抖动）不能把消费循环炸死 —— 消息留在 PEL 下轮重投，
+    幂等键兜住重复；循环崩掉才是真事故（统计永久停摆，正是本模块最该避免的失败模式）。
+    """
+    class FlakyAckRedis(FakeRedis):
+        async def xack(self, stream, group, msg_id):
+            raise RuntimeError("redis blip")       # 永远 ACK 不成功
+
+    redis = FlakyAckRedis(batches=[[("1-0", dict(EVENT))], []])
+    calls = {"n": 0}
+
+    async def counting_handler(db, fields):
+        calls["n"] += 1
+        await consumer.handle_event(db, fields)
+
+    _run_consumer(redis, maker, counting_handler)
+
+    assert calls["n"] >= 2, "XACK 失败后消息应被重投，而不是把任务炸崩、循环停止"
+
+    async def _count():
+        async with maker() as db:
+            return await db.scalar(select(func.count()).select_from(QaEvent))
+
+    assert asyncio.run(_count()) == 1, "重投不得造成重复计数（幂等键必须兜住）"
+
+
+def test_consumer_crash_is_logged_not_silent(caplog):
+    """★ 消费任务意外崩溃必须立刻留下 error 日志（统计停摆不能无声无息）。
+
+    设计文档 13 节对「消费者停了」的对策之一就是 error 日志；而 create_task 的异常
+    无人取时，直到 GC 才可能出一句 warning，与正常关闭无从区分。
+    """
+    async def boom():
+        raise RuntimeError("unexpected crash")
+
+    async def go():
+        task = asyncio.create_task(boom())
+        task.add_done_callback(consumer.log_consumer_crash)
+        with suppress(RuntimeError):
+            await task      # 取回异常，验证的是回调留下的日志
+
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(go())
+
+    assert [r for r in caplog.records if r.levelno == logging.ERROR], \
+        "崩溃必须留下 error 日志"
+
+
+def test_consumer_cancel_does_not_log_crash(caplog):
+    """正常关闭（cancel）不是崩溃：不许打 error 日志（否则每次重启都误报事故）。"""
+    async def go():
+        task = asyncio.create_task(asyncio.sleep(10))
+        task.add_done_callback(consumer.log_consumer_crash)
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(go())
+
+    assert not [r for r in caplog.records if r.levelno == logging.ERROR]

@@ -51,6 +51,19 @@ async def handle_event(db, fields: dict) -> None:
         logger.info("[qa-event] 重复事件，已忽略 event_id=%s", row.event_id)
 
 
+async def _safe_xack(redis, stream: str, group: str, msg_id: str) -> None:
+    """ACK 失败不致命：消息留在 PEL、下轮重投，幂等键兜住重复 —— 崩溃才是真事故。
+
+    若让 XACK 的异常冒出去，一次 Redis 抖动就会把整个消费循环带走（统计永久停摆，
+    正是本模块最该避免的失败模式）；留在 PEL 反而有自愈机会：重投 → 幂等键挡重复
+    → 下次 XACK 成功即清掉。
+    """
+    try:
+        await redis.xack(stream, group, msg_id)
+    except Exception as exc:
+        logger.warning("[qa-event] XACK 失败（消息将重投，幂等兜底）id=%s: %s", msg_id, exc)
+
+
 async def consume(redis, session_factory, handler=handle_event,
                   max_retries: int = MAX_RETRIES, poll_interval: float = 1.0,
                   group: str = GROUP, consumer: str = CONSUMER) -> None:
@@ -98,10 +111,10 @@ async def consume(redis, session_factory, handler=handle_event,
                                attempts[msg_id], max_retries, msg_id, exc)
                 if attempts[msg_id] >= max_retries:
                     await _to_dead_letter(redis, stream, msg_id, fields, exc)
-                    await redis.xack(stream, group, msg_id)   # 原事件也 ACK，不再重投
+                    await _safe_xack(redis, stream, group, msg_id)   # 原事件也 ACK，不再重投
                     attempts.pop(msg_id, None)
                 continue
-            await redis.xack(stream, group, msg_id)
+            await _safe_xack(redis, stream, group, msg_id)
             attempts.pop(msg_id, None)
 
         await asyncio.sleep(poll_interval)
@@ -117,3 +130,15 @@ async def _to_dead_letter(redis, stream: str, msg_id: str, fields: dict, exc) ->
         logger.error("[qa-event] 超重试上限，已投死信流 id=%s", msg_id)
     except Exception as e:
         logger.error("[qa-event] 投死信流失败 id=%s: %s", msg_id, e)
+
+
+def log_consumer_crash(task: "asyncio.Task") -> None:
+    """create_task 起的消费任务若意外崩溃，异常无人取 —— 直到 GC 才可能出一句 warning，
+    与正常关闭无从区分。挂到 done 回调上，把「统计已停止」立刻记成 error
+    （设计文档 13 节对「消费者停了」的对策之一）。正常关闭（cancel）不算崩溃、不打日志。
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("[qa-event] 消费任务意外退出（统计已停止，业务不受影响）: %s", exc)
