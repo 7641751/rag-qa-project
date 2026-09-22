@@ -169,3 +169,28 @@ def test_get_optional_redis_returns_command_usable_client():
     for method in ("get", "set", "delete", "xadd"):   # xadd 供 Task 7 的消费端复用
         assert callable(getattr(client, method, None)), f"缺少 {method}：缓存工具会静默降级"
     assert client.connection_pool is pool, "必须复用 state 上的池，不能另建"
+
+
+# ============================ main 的建池契约（P4 复审：超时是必填项）============================
+def test_build_redis_pool_has_timeouts_and_none_when_unconfigured():
+    """★ 池必须带 3s 超时；未配置必须返回 None（而不是抛）。
+
+    超时缺失的代价是实测出来的：Redis 主机黑洞（DROP）且客户端无超时时，每次连接
+    尝试白等 5010ms —— 每个列表请求都被拖 5 秒才降级回源；加 3s 超时后封顶 3008ms。
+    所以这条断言的实质是「降级承诺的时间上限」，不是参数存在性检查。
+
+    （这里才 import 真实的 main：本文件其余用例靠探针 app 保持无 chroma/LLM 导入链，
+    见文件中部 fixture 的注释；main 的导入链已被 test_kb_requires_login 等覆盖，
+    惰性 import 只是让本文件单独跑时不必付这份成本。）
+    """
+    from backend.app.api.main import build_redis_pool
+
+    pool = build_redis_pool("redis://127.0.0.1:6399/0")
+    kw = pool.connection_kwargs
+    assert kw["socket_connect_timeout"] == 3 and kw["socket_timeout"] == 3, \
+        "无超时 ⇒ 黑洞时每请求白等 5 秒（实测 5010ms），降级承诺落空"
+    assert kw["decode_responses"] is True, "少了它就是 bytes，业务比较会静默失配"
+
+    assert build_redis_pool("") is None, "未配置必须返回 None（走旁路），而不是抛"
+    assert build_redis_pool(None) is None
+    assert build_redis_pool("   ") is None, "空白串也按未配置处理"

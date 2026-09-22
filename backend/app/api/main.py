@@ -12,19 +12,31 @@ from backend.app.agent.schemas import Health
 from backend.app.api import auth_router, chat_router, kb_router
 from redis import asyncio as aioredis
 
+
+def build_redis_pool(redis_url: str | None) -> aioredis.ConnectionPool | None:
+    """建 Redis 连接池；未配置返回 None，**超时是必填项、不是调优项**。
+
+    · 未配置**不能**无条件 from_url("")：会抛
+      ValueError: Redis URL must specify one of the following schemes (redis://, ...)
+      那会让整个后端起不来。Redis 是可选依赖，缺它不该拖垮启动 ——
+      未配置就返回 None，把可操作的报错留给真正用到它的 get_redis_pool。
+    · 两个超时必须显式给（实测）：Redis 主机黑洞（DROP/消失）而客户端无超时时，
+      **每次连接尝试要白等 5010ms** —— 每个列表请求都被拖 5 秒才降级回源，
+      「缓存故障不得升级为业务故障」的承诺就落空了。3s 封顶（实测 3008ms）与
+      tests/test_redis.py 的取值一致；命令级错误（如认证失败）本就是毫秒级。
+    """
+    url = (redis_url or "").strip()
+    if not url:
+        return None
+    return aioredis.ConnectionPool.from_url(url, decode_responses=True,
+                                            socket_connect_timeout=3, socket_timeout=3)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     # 启动：异步 checkpointer 依赖事件循环，首个请求时惰性构造，无需预热
     await init_db()
-    # ⚠ 未配置时**不能**无条件建池：from_url("") 会抛
-    #   ValueError: Redis URL must specify one of the following schemes (redis://, ...)
-    #   那会让整个后端起不来。Redis 目前是可选依赖，缺它不该拖垮启动 ——
-    #   未配置就置 None，把可操作的报错留给真正用到它的 get_redis_pool。
-    redis_url = (settings.redis_url or "").strip()
-    app.state.redis_pool = (
-        aioredis.ConnectionPool.from_url(redis_url, decode_responses=True)
-        if redis_url else None
-    )
+    app.state.redis_pool = build_redis_pool(settings.redis_url)
     # 问答事件消费端（P4 Task 7）：统计是可丢的派生数据 —— 只配了 Redis 才起，
     # 起不来/挂掉都不影响任何业务请求（失败由它自己吞、只记日志）。
     consumer_task = None
