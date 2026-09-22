@@ -19,6 +19,7 @@ env_prefix 是 `RAGQA_` —— 两者都对得上靠的是该字段上的 valida
 运行方式（在 rag_qa_project 目录下）：
     python -m pytest tests/test_redis.py -v
 """
+import asyncio
 import sys
 from pathlib import Path
 
@@ -31,6 +32,10 @@ from config import settings  # noqa: E402
 
 # 放在 import 之后、用例之前：缺包时整文件跳过，而不是让每个用例各自炸一次
 redis = pytest.importorskip("redis", reason="未安装 redis-py：pip install 'redis>=5.0'")
+
+# 异步客户端（P4 在线用例用）：cached_json / invalidate / 消费端全是 async API。
+# 与上面的同步 `redis` 区分开 —— 同步客户端没有 __aenter__，await 会直接炸。
+aioredis = pytest.importorskip("redis.asyncio", reason="未安装 redis-py 的 asyncio 支持")
 
 def _configured_url() -> str:
     """取配置里的 Redis 连接串；**未配置时 skip**（不是 fail）。"""
@@ -78,3 +83,88 @@ def test_configured_redis_url_is_reachable():
 
     with redis.from_url(url, socket_connect_timeout=3, socket_timeout=3) as client:
         assert client.ping() is True, "PING 未返回 True"
+
+
+# ============================ 3. P4 在线用例：缓存 / 失效 / Streams（真 Redis）============================
+async def _async_value(v):
+    """把普通值包成 awaitable，供 cached_json 的 loader 参数用。"""
+    return v
+
+
+@pytest.mark.redis
+def test_setex_ttl_is_applied():
+    """真 Redis 才验得了 TTL：写回后剩余 TTL 必须落在 (0, ttl]。
+
+    离线套件只能断到「set 时带了 ex 参数」（参数层）；真 Redis 才能证明这个 ex
+    真的被服务端执行了 —— 参数对了而服务端没设 TTL 是参数层看不见的。
+    """
+    from backend.tools.redis_cache_tools import cached_json
+
+    async def go():
+        async with aioredis.from_url(_configured_url(), decode_responses=True,
+                                     socket_connect_timeout=3, socket_timeout=3) as client:
+            key = "ragqa:test:ttl"
+            await client.delete(key)
+            await cached_json(client, key, 30, lambda: _async_value({"a": 1}))
+            ttl = await client.ttl(key)
+            await client.delete(key)
+            return ttl
+
+    ttl = asyncio.run(go())
+    assert 0 < ttl <= 30
+
+
+@pytest.mark.redis
+def test_invalidate_makes_next_read_miss():
+    """删键后下一次读必须回源（这是「改名后立刻生效」的机制）。"""
+    from backend.tools.redis_cache_tools import cached_json, invalidate
+
+    calls = []
+
+    async def loader():
+        calls.append(1)
+        return len(calls)
+
+    async def go():
+        async with aioredis.from_url(_configured_url(), decode_responses=True,
+                                     socket_connect_timeout=3, socket_timeout=3) as client:
+            key = "ragqa:test:invalidate"
+            await client.delete(key)
+            first = await cached_json(client, key, 30, loader)
+            await invalidate(client, key)
+            second = await cached_json(client, key, 30, loader)
+            await client.delete(key)
+            return first, second
+
+    first, second = asyncio.run(go())
+    assert first == 1 and second == 2, "删键后必须重新回源"
+
+
+@pytest.mark.redis
+def test_stream_produce_and_consume_roundtrip():
+    """生产 → 消费组读 → XACK 全链路一次（真 Redis）。
+
+    这同时是**消费端 API 用法的兼容性校验**：消费端此前只在 FakeRedis 上验过，
+    这里用与 `qa_event_consumer.consume` 完全同形的调用（xgroup_create 的 id/mkstream、
+    xreadgroup 的 ">"、xack 的三参形态）在真 redis-py 上走一遍 —— 参数形态错的
+    话，离线替身是发现不了的。
+    """
+    async def go():
+        async with aioredis.from_url(_configured_url(), decode_responses=True,
+                                     socket_connect_timeout=3, socket_timeout=3) as client:
+            key = "ragqa:test:stream"
+            group = "ragqa_test_group"
+            await client.delete(key)
+            await client.xadd(key, {"event_id": "e2e", "user_id": "1"},
+                              maxlen=100, approximate=True)
+            await client.xgroup_create(key, group, id="0", mkstream=True)
+            resp = await client.xreadgroup(group, "t1", {key: ">"}, count=1)
+            msg_id, fields = resp[0][1][0]
+            await client.xack(key, group, msg_id)
+            pending = await client.xpending(key, group)
+            await client.delete(key)
+            return fields, pending
+
+    fields, pending = asyncio.run(go())
+    assert fields["event_id"] == "e2e" and fields["user_id"] == "1"
+    assert pending["pending"] == 0, "XACK 后 PEL 必须清空"
