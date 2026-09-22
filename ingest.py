@@ -14,7 +14,25 @@ from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter, Language
 from dotenv import load_dotenv
-load_dotenv(Path(__file__).resolve().parents[2] / ".env")   # 项目根 .env
+
+
+def _repo_env_file(src: Path) -> Path | None:
+    """项目根 .env = src 上方两层处的 .env；路径层级不足（容器内 /app/）时返回 None。
+
+    容器里代码在 /app/（只有两层父目录），直接 parents[2] 会 IndexError ——
+    本模块被 get_vectorstore() import，崩的代价是「一提问就炸」+ 健康检查静默
+    丢 kb_count（2026-09-22 云部署实测）。容器内没有 .env（.dockerignore 排除），
+    密钥全部由 compose 的环境变量注入，所以正确行为是跳过而不是崩。
+    """
+    try:
+        return src.resolve().parents[2] / ".env"
+    except IndexError:
+        return None
+
+
+_repo_env = _repo_env_file(Path(__file__))
+if _repo_env is not None:
+    load_dotenv(_repo_env)   # 项目根 .env（本地开发）
 
 # Windows 控制台 UTF-8 输出
 if hasattr(sys.stdout, "reconfigure"):
