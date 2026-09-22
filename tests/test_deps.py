@@ -194,3 +194,17 @@ def test_build_redis_pool_has_timeouts_and_none_when_unconfigured():
     assert build_redis_pool("") is None, "未配置必须返回 None（走旁路），而不是抛"
     assert build_redis_pool(None) is None
     assert build_redis_pool("   ") is None, "空白串也按未配置处理"
+
+
+def test_should_start_consumer_respects_rollback_switch():
+    """★ 开关关闭 = 回滚到 P4 之前（设计文档 9.2 #7「完全不碰 Redis」）：消费端也要停。
+
+    生产端此时本就不产事件（开关关闭 ⇒ get_optional_redis 返回 None ⇒ 不 XADD），
+    消费端若继续轮询，只是白碰 Redis 且与「行为回到今天」矛盾 —— 缓存与事件流
+    必须一起停，才谈得上「完全」。
+    """
+    from backend.app.api.main import should_start_consumer
+
+    assert should_start_consumer(object(), True) is True
+    assert should_start_consumer(object(), False) is False, "开关关 ⇒ 消费端必须停"
+    assert should_start_consumer(None, True) is False, "未配置 ⇒ 消费端不启动"

@@ -32,6 +32,18 @@ def build_redis_pool(redis_url: str | None) -> aioredis.ConnectionPool | None:
                                             socket_connect_timeout=3, socket_timeout=3)
 
 
+def should_start_consumer(pool, cache_enabled: bool) -> bool:
+    """消费端启停判据：配了 Redis **且**回滚开关开着。
+
+    ⚠ 开关关闭 = 回滚到 P4 之前的行为（设计文档 9.2 #7「完全不碰 Redis」、12 节 #8
+    「行为回到今天」）：生产端此时本就不产事件（开关关闭 ⇒ get_optional_redis 返回
+    None ⇒ 不 XADD），消费端再轮询只是白碰 Redis —— 缓存与事件流必须一起停，才谈得上
+    「完全」。（8 区实测用 Redis commandstats 差量验证：开关关闭 + Redis 在跑时，
+    xgroup_create/xreadgroup/get/set/xadd 调用数零增长。）
+    """
+    return pool is not None and cache_enabled
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     # 启动：异步 checkpointer 依赖事件循环，首个请求时惰性构造，无需预热
@@ -40,7 +52,7 @@ async def lifespan(_: FastAPI):
     # 问答事件消费端（P4 Task 7）：统计是可丢的派生数据 —— 只配了 Redis 才起，
     # 起不来/挂掉都不影响任何业务请求（失败由它自己吞、只记日志）。
     consumer_task = None
-    if app.state.redis_pool is not None:
+    if should_start_consumer(app.state.redis_pool, settings.redis_cache_enabled):
         from backend.app.services.qa_event_consumer import consume, log_consumer_crash
         from backend.tools.mysql_db_tools import get_db_session_maker
         consumer_task = asyncio.create_task(
