@@ -1,0 +1,17 @@
+# ---- 构建上下文瘦身：镜像里只要运行时代码 ----
+data/
+frontend/
+docs/
+tests/
+scripts/
+.superpowers/
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+.env
+.env.*
+*.md
+_big_sample.md

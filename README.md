@@ -217,6 +217,24 @@ Vite 已配好 proxy，把 `/api` 转发到 `:8000`，所以前端代码里一�
 npm run mock
 ```
 
+### 5. 起全栈（Docker Compose，可选）
+
+不想手工配 MySQL / Redis 时，一条命令起全栈（MySQL + Redis + 后端 + 前端 nginx）：
+
+```bash
+cd advanced_tutorial/rag_qa_project
+cp .env.example .env        # 填 DEEPSEEK_API_KEY / DASHSCOPE_API_KEY / RAGQA_JWT_SECRET
+docker compose up -d --build
+# 打开 http://localhost:8080（/docs 也经 nginx 反代可看）
+```
+
+要点：
+
+- **数据复用**：Chroma 向量库 / 上传件 / 会话 checkpoints 挂载宿主机 `./data`——不重复入库；
+- **网络**：MySQL / Redis 只在容器网络内（不占宿主机端口），密码由 `.env` 控制；前端 nginx 反代 `/api` 与 `/docs`，两个 SSE 端点已关缓冲（保证逐 token 流式）；
+- **密钥只走环境变量**（`.env` 已被 `.gitignore` 忽略），不会烘进镜像；
+- **前置**：Docker Desktop 需可用的 WSL2（`wsl --install` 后重启一次）；Docker Hub 拉取慢时给 Docker 配代理或镜像加速。
+
 ---
 
 ## CLI 用法

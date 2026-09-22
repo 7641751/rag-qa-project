@@ -1,0 +1,91 @@
+# rag_qa_project/docker-compose.yml —— 一键起全栈：MySQL + Redis + 后端 + 前端(nginx)
+name: ragqa
+
+# 用法：
+#   1) cp .env.example .env   并填入密钥（.env 已被 .gitignore 忽略，不会入库）
+#   2) docker compose up -d --build
+#   3) 浏览器打开 http://localhost:8080（/docs 也已经 nginx 反代，可直接看）
+#
+# 与本地开发的区别：
+#   · MySQL / Redis 都跑在容器里（不对宿主机暴露端口），地址由 environment 覆盖为服务名；
+#   · Chroma 向量库 / 上传件 / 会话 checkpoints 挂载宿主机 ./data —— 直接复用已入库的知识库，无需重新 ingest；
+#   · 密钥与模型端点从同目录 .env 注入（compose 自动读取），模板见 .env.example。
+services:
+  mysql:
+    image: mysql:8.0
+    # 与 P4 建表参数一致：utf8mb4_0900_ai_ci 排序规则需要 MySQL 8（5.7 没有）
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci
+    environment:
+      MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD:-ragqa_root_pw}"
+      MYSQL_DATABASE: ragqa
+      MYSQL_USER: ragqa
+      MYSQL_PASSWORD: "${MYSQL_PASSWORD:-ragqa_pw}"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    # 与 REDIS_URL 保持一致的 requirepass；AOF 打开：重启不丢 Streams（qa_stats / 死信）与缓存
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-ragqa_redis_pw}", "--appendonly", "yes"]
+    environment:
+      REDIS_PASSWORD: "${REDIS_PASSWORD:-ragqa_redis_pw}"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $$REDIS_PASSWORD ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+    environment:
+      # 容器网络内地址（覆盖开发机的本机 / VM 地址）
+      RAGQA_MYSQL_DATABASE_URL: "mysql+aiomysql://ragqa:${MYSQL_PASSWORD:-ragqa_pw}@mysql:3306/ragqa?charset=utf8mb4"
+      REDIS_URL: "redis://:${REDIS_PASSWORD:-ragqa_redis_pw}@redis:6379/0"
+      # 模型 / 追踪：从 .env 注入（:? 表示缺失即报错——启动前就发现配漏，而不是跑起来才炸）
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:?缺少 DEEPSEEK_API_KEY（写在 rag_qa_project/.env）}"
+      DEEPSEEK_BASE_URL: "${DEEPSEEK_BASE_URL:-https://api.deepseek.com}"
+      DASHSCOPE_API_KEY: "${DASHSCOPE_API_KEY:?缺少 DASHSCOPE_API_KEY（写在 rag_qa_project/.env）}"
+      DASHSCOPE_BASE_URL: "${DASHSCOPE_BASE_URL:-}"
+      RAGQA_JWT_SECRET: "${RAGQA_JWT_SECRET:?缺少 RAGQA_JWT_SECRET（≥32 字节，写在 rag_qa_project/.env）}"
+      LANGSMITH_TRACING: "${LANGSMITH_TRACING:-false}"
+      LANGSMITH_API_KEY: "${LANGSMITH_API_KEY:-}"
+      LANGSMITH_PROJECT_NAME: "${LANGSMITH_PROJECT_NAME:-ragqa}"
+      LANGSMITH_ENDPOINT: "${LANGSMITH_ENDPOINT:-}"
+    volumes:
+      # 复用宿主机知识库 / 上传件 / checkpoints（读写同一份 data/）
+      - ./data:/app/data
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5)"]
+      interval: 15s
+      timeout: 10s
+      start_period: 60s
+      retries: 5
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  mysql_data:
+  redis_data:

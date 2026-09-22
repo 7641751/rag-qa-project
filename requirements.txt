@@ -3,11 +3,11 @@ langchain>=1.3
 langchain-core>=1.0          # ← 新增：graph.py/chat_service.py 直接 import langchain_core.*
 langgraph>=1.2
 langchain-deepseek>=1.1
-langchain-huggingface>=1.2
+langchain-huggingface>=1.2  # 运行时不用（嵌入走 DashScope）；容器构建会过滤这两行，见 Dockerfile
 langchain-chroma>=0.2
 langchain-text-splitters>=0.3
 chromadb>=1.5
-sentence-transformers>=5.0
+sentence-transformers>=5.0   # 同上：只拖 torch 却没人 import；本地实验保留，容器不装
 pydantic-settings>=2.0
 python-dotenv>=1.0
 pytest>=8.0
@@ -17,6 +17,9 @@ langgraph-checkpoint-sqlite
 aiosqlite>=0.22             # graph.py 直接 import（AsyncSqliteSaver 的异步连接层；此前仅是传递依赖）
 bcrypt
 redis>=5.0                  # backend/tools/redis_cache_tools.py（P4 读缓存）与 tests/test_redis.py 的连通性自检
+SQLAlchemy>=2.0             # backend/app/models.py / backend/tools/mysql_db_tools.py 直连 import（此前仅靠传递依赖满足）
+aiomysql>=0.2               # MySQL 异步驱动：RAGQA_MYSQL_DATABASE_URL 用 mysql+aiomysql://
+PyJWT>=2.8                  # backend/tools/security.py 签发 / 校验 JWT（HS256）
 
 # ↓ 后端(Web)：api/main.py、chat_router.py 直接 import fastapi（同理会告警）
 fastapi>=0.115
