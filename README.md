@@ -118,7 +118,8 @@ rag_qa_project/                      ← 唯一 Python 源根（见「开发约�
 ├── requirements.txt                 # 可读依赖清单（实际安装以 pyproject.toml + uv 为准；Docker 按行安装）
 ├── Dockerfile / docker-compose.yml  # 全栈部署（MySQL + Redis + backend + frontend nginx）
 ├── scripts/
-│   └── migrate_kb_user_id.py        # P3 一次性迁移：给旧上传件补 user_id（--dry-run / --yes）
+│   ├── migrate_kb_user_id.py        # P3 一次性迁移：给旧上传件补 user_id（--dry-run / --yes）
+│   └── measure_ttft.py              # 首 token 延迟实测（可 --spawn-server 自己拉起后端；见「TTFT」）
 │
 ├── backend/                         # 只放生产代码（教学 demo 已移到 docs/examples/）
 │   ├── tools/                       # 无业务语义的通用能力层
@@ -729,6 +730,42 @@ P3 之前的旧上传件没有 `user_id`，必须先用 `scripts/migrate_kb_user
 > （原因是 RRF 对重复内容累加计分，重复 chunk 被顶到前面）。
 > 所以「不引入 BM25」是数据驱动的决策，而不是偷懒 —— 详见下方「检索评估」。
 
+**③ 缓存不可达时，每次提问在 SSE 响应头之前同步白等 3 秒**（本机实测，2026-09-22）。
+
+- **现象**：`POST /api/chat/stream` 的 **200 响应头要 3073ms 才到达**。
+  对照 —— `GET /api/health` 28ms、`GET /api/auth/me`（同样走 MySQL）19ms；
+  而**进程内**直接跑图、跑到第一个 `update` 只要 **281ms**。
+  即：这 ~2.8s 全部花在「进图之前」，与检索、LLM 都无关。
+- **定位**：`chat_router.py` 在返回 `StreamingResponse` **之前** `await chat_service.prepare_stream(...)`，
+  它内部依次做 `assert_owner` → `upsert_conversation` → **`commit`** → `await invalidate(redis, …)`。
+  前三步走本地 MySQL（十几毫秒），最后一步在 Redis 不可达时白等 `socket_connect_timeout=3`
+  （`main.py` 里显式设的 3s 上限，注释还写了「Redis 主机黑洞时每次连接尝试要白等 5010ms」）。
+- **成因**：`.env` 的 `REDIS_URL` 指向 `192.168.88.130:6379`（VMware NAT 网段的虚拟机），
+  该地址当时不可达。**项目自带的连通性自检 `pytest -m redis` 当时就是红的**
+  —— 这正是 `pytest.ini` 坚持「需要真实服务的用例必须显式排除而不是 skip」的价值：
+  它没被 skip 掩盖，只是没人跑。
+- **对照实验**（同一台机器、同一份代码，用项目自己的回滚开关只改 Redis 可达性）：
+
+  | 指标 | `REDIS_URL` 指向不可达地址 | `RAGQA_REDIS_CACHE_ENABLED=false` | 差值 |
+  |---|---|---|---|
+  | 首事件 p50 | 3.40s | **0.25s** | **−3.15s** |
+  | 首 token 延迟 p50 | 4.83s | **1.71s** | **−3.12s** |
+  | 端到端总耗时 p50 | 10.99s | 5.00s | −5.99s |
+
+  差值 3.12s 与 `socket_connect_timeout=3` 精确吻合。15 次采样极稳（TTFT min 4.29 / max 5.45），
+  所以**不是冷启动**。
+- **为什么「降级设计」没兜住**：P4 的承诺是「缓存故障**不得升级为业务故障**」——
+  这一点**确实做到了**：Redis 挂了请求仍返回 200、答案仍正确、`grounded` 仍为 true。
+  但它只承诺了**功能**不降级，**没承诺延迟不劣化** —— 而 3 秒恰好落在用户等待最敏感的那段路径上
+  （响应头之前，连「正在检索」的 `step` 帧都还没发出去，用户看到的是纯白屏）。
+- **修法（两选一，都还没做）**：
+  1. **配置层**（本次的直接成因）：把 `REDIS_URL` 指向可达实例，并让 `pytest -m redis` 进 CI
+     —— 现在 CI 只跑离线用例，这类「环境配了却连不上」的问题 CI 看不见；
+  2. **代码层**：把 `invalidate` 移出「响应头之前」的关键路径（`BackgroundTasks` 或
+     `asyncio.create_task`）—— 「先 commit 后 DEL」的顺序仍然成立（删键本就是 best-effort，
+     有 60s TTL 兜底）。更彻底的是加**熔断**：连续 N 次失败后一段时间内直接跳过 Redis，
+     避免每个请求都重付一次超时。
+
 ---
 
 ## 检索评估
@@ -767,6 +804,35 @@ uv run python eval_retrieval.py --detail           # 打印每条 query 的各�
 
 BM25 索引的两个真实成本（冷启动时打印）：全量建索引约 2.2s、常驻几十 MB，
 且它是**静态快照** —— 知识库上传后必须 `cache_clear()` 重建，否则新文档在稀疏检索里不可见。
+
+---
+
+## 首 token 延迟（TTFT）
+
+recall / MRR 只回答「找得到吗」，不回答「要等多久」。用户体感的是**首 token 延迟** ——
+从点下发送到第一段文字出现，中间夹着：检索 → 相关性评分 →（可能）重写 → 生成的首个 token。
+
+```bash
+uv run python scripts/measure_ttft.py                  # 对着已在跑的服务测（默认 127.0.0.1:8000）
+uv run python scripts/measure_ttft.py --spawn-server    # 自己拉起后端再测（一条命令出一个数字）
+uv run python scripts/measure_ttft.py --n 3             # 每条查询重复 3 次，看分位数
+uv run python scripts/measure_ttft.py --base-url http://<IP>:8080   # 量公网真实延迟
+```
+
+**实测**（本机，5 条查询，Redis 按「已知问题 ③」绕开后测得）：
+
+| 指标 | p50 | p95 |
+|---|---|---|
+| 首 token 延迟（TTFT） | **1.71s** | 2.10s |
+| 首事件延迟（第一个 `step` 帧，即「检索」开始可见） | **0.25s** | — |
+| 端到端总耗时 | 5.00s | 5.04s |
+
+拆解：TTFT ≈ `检索 + 评分（首事件，0.25s）` + `生成首个 token（~1.4s，取决于 DeepSeek 首包）`。
+所以**检索根本不是瓶颈** —— 想压 TTFT 应该先动生成侧或缓存侧，而不是加大 `top_k`。
+
+> ⚠️ **这个 1.71s 是在绕开 Redis 的条件下测的**，不是默认配置的表现。
+> 默认配置（`REDIS_URL` 指向不可达地址）下同一脚本实测 TTFT p50 = 4.83s、首事件 3.40s。
+> 两者的差值就是「已知问题 ③」，详见那一节。
 
 ---
 

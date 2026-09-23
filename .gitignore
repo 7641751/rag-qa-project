@@ -59,6 +59,12 @@ index_metadata.pickle
 data/eval_results.json
 data/_eval*
 
+# TTFT 实测（scripts/measure_ttft.py）的产物与 --spawn-server 的服务日志：
+# 同样是可重建的派生数据（重跑一条命令即可复现），不进库。
+data/ttft_*.json
+data/_ttft_server.log
+data/_probe_*.log
+
 # ---------- 用户上传的原件（个人笔记 / 课程资料）----------
 # 这是运行时数据而不是源码。注意它同时是向量库的**真相源**
 # （ingest.py --force 重建时靠它捞回用户文档），所以本地别删。
