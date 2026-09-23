@@ -14,7 +14,12 @@ FastAPI 以 SSE 流式吐出推理步骤与答案 token，React 前端渲染 Mar
 
 [![CI](https://github.com/7641751/rag-qa-project/actions/workflows/ci.yml/badge.svg)](https://github.com/7641751/rag-qa-project/actions/workflows/ci.yml)
 
-**线上地址：<http://47.114.103.158:8080>**（可直接注册使用；Docker Compose 全栈部署）
+**线上地址：<https://ragqa753.duckdns.org:8443>**（Let's Encrypt 证书，可直接注册使用）
+
+> 为什么带端口号：服务器在阿里云**境内**节点，域名走 80/443 需 ICP 备案。
+> 证书因此走 **DNS-01** 验证（只写一条 `_acme-challenge` TXT 记录，与对外端口无关），
+> HTTPS 落在非 80/443 的 8443 上。备用入口：`http://47.114.103.158:8080`（IP 直连，调试用）。
+> 完整实施记录见 [`docs/superpowers/plans/2026-09-22-cloud-deploy.md`](docs/superpowers/plans/2026-09-22-cloud-deploy.md) 的 Task 6。
 
 | | |
 |---|---|
@@ -922,17 +927,20 @@ uv run python scripts/measure_ttft.py --base-url http://<IP>:8080   # 量公网�
 
 **实测**（5 条查询，`--n 1`）：
 
-| 指标 | 公网（`http://47.114.103.158:8080`） | 本机（Redis 已绕开） |
-|---|---|---|
-| 首 token 延迟（TTFT）　p50 / p95 | **1.60s** / 2.44s | 1.71s / 2.10s |
-| 首事件延迟（第一个 `step` 帧，「检索」开始可见） | **0.33s** | 0.25s |
-| 端到端总耗时　p50 / p95 | **4.70s** / 6.11s | 5.00s / 5.04s |
-| 兜底率（`grounded=false`） | 0/5 | 0/5 |
+| 指标 | 公网 HTTPS（`ragqa753.duckdns.org:8443`） | 公网 HTTP（IP:8080） | 本机（Redis 已绕开） |
+|---|---|---|---|
+| 首 token 延迟（TTFT）　p50 / p95 | **1.48s** / 1.89s | 1.60s / 2.44s | 1.71s / 2.10s |
+| 首事件延迟（第一个 `step` 帧，「检索」开始可见） | **0.34s** | 0.33s | 0.25s |
+| 端到端总耗时　p50 / p95 | **4.37s** / 4.61s | 4.70s / 6.11s | 5.00s / 5.04s |
+| 兜底率（`grounded=false`） | 0/5 | 0/5 | 0/5 |
 
-**拆解**：TTFT ≈ `检索 + 评分`（首事件，**0.33s**）+ `生成首个 token`（≈1.3s，取决于 DeepSeek 首包）。
+**拆解**：TTFT ≈ `检索 + 评分`（首事件，**0.34s**）+ `生成首个 token`（≈1.1s，取决于 DeepSeek 首包）。
 所以**检索根本不是 TTFT 的瓶颈** —— 想压首 token 延迟应该动生成侧或缓存侧，而不是加大 `top_k`。
+
 公网比本机只多 ~80ms，说明 nginx 反代 + 跨网往返的开销可以忽略（`X-Accel-Buffering: no` 确实生效，
 否则 SSE 会被 nginx 憋成一次性输出，TTFT 会跳到总耗时量级）。
+**HTTPS 那列又多了一跳 Caddy，但首事件与 HTTP 完全一致（0.34s vs 0.33s）** —— 这也顺带证明了
+反向代理层没有引入缓冲（Caddy 默认对流式响应即时透传）。
 
 > ⚠️ **本机那列是「绕开 Redis」后测的**，不是默认配置的表现。
 > 本机默认配置（`REDIS_URL` 指向不可达地址）下同一脚本实测 TTFT p50 = 4.83s、首事件 3.40s

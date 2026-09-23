@@ -1,0 +1,41 @@
+# caddy/Caddyfile —— 线上 HTTPS 入口（DNS-01 签发 Let's Encrypt 证书）
+#
+# 变量由 docker-compose.https.yml 注入（`{$VAR}` 是 Caddyfile 的解析期环境变量占位符）：
+#   RAGQA_DOMAIN   例如 ragqa-demo.duckdns.org
+#   DUCKDNS_TOKEN  DuckDNS 账户页面上的 token，用于写 _acme-challenge TXT 记录
+
+{
+	# 单机场景不需要 admin API —— 少一个本地监听端口
+	admin off
+
+	# 证书、ACME 账户与私钥都落在这里（compose 挂了卷，容器重建不会重新签发，
+	# 否则反复重签会撞上 Let's Encrypt 的速率限制）
+	storage file_system /data
+
+	# 只开 h1/h2：关闭 HTTP/3 可少一个 UDP 监听，避免「为什么 UDP 8443 也开着」的困惑
+	servers {
+		protocols h1 h2
+	}
+}
+
+# 非 80/443 端口（备案约束，见 caddy/Dockerfile 顶部注释）。
+# 站点地址里的主机名同时决定证书要签哪个名字。
+{$RAGQA_DOMAIN}:8443 {
+	tls {
+		dns duckdns {$DUCKDNS_TOKEN}
+	}
+
+	# 反代到前端 nginx：它同时负责静态资源与 /api、/docs 的反代，且两个 SSE 端点
+	# 已关缓冲（见 frontend/nginx.conf）—— 换 HTTPS 不改变这条链路，只是外面多一跳。
+	reverse_proxy frontend:80 {
+		header_up X-Real-IP {remote_host}
+	}
+
+	# 访问日志：证书/握手问题排查时，没有它只能靠猜
+	log {
+		output file /data/access.log {
+			roll_size 10MiB
+			roll_keep 3
+		}
+	}
+}

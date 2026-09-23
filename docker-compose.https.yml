@@ -1,0 +1,46 @@
+# docker-compose.https.yml —— 叠加层：给线上地址加 HTTPS（可选，不影响 8080）
+#
+# 用法（与主 compose 叠加，只需启动新增的 caddy 服务）：
+#   docker compose -f docker-compose.yml -f docker-compose.https.yml up -d caddy
+#
+# 前置条件（两件都不可省）：
+#   1) .env 里补上 RAGQA_DOMAIN 与 DUCKDNS_TOKEN（缺任一个 compose 直接报错，
+#      而不是起一个证书签不出来的容器 —— 早失败比晚失败好排查）；
+#   2) 云服务器安全组放行 **8443**（TCP）。**不需要** 80/443：
+#      证书走 DNS-01，而 8443 是非 80/443 端口，因此不触发未备案域名的拦截。
+#
+# 为什么不复用 frontend 容器的 nginx 直接上 TLS：
+#   frontend 镜像的定位是「构建产物 + 静态托管 + /api 反代」，与 ACME 证书生命周期
+#   搅在一起会让它同时承担两个职责；而且换证书就得重启业务容器。Caddy 独立一层，
+#   证书续期对业务零影响。
+#
+# 与 8080 的关系：两者并存。8080 继续用 IP 直连（调试、健康检查方便），
+# 8443 是给人看的正式地址。
+services:
+  caddy:
+    build:
+      context: ./caddy
+    environment:
+      RAGQA_DOMAIN: "${RAGQA_DOMAIN:?缺少 RAGQA_DOMAIN（如 xxx.duckdns.org，写在 rag_qa_project/.env）}"
+      DUCKDNS_TOKEN: "${DUCKDNS_TOKEN:?缺少 DUCKDNS_TOKEN（DuckDNS 账户页面的 token，写在 rag_qa_project/.env）}"
+    ports:
+      - "8443:8443"
+    volumes:
+      # Caddyfile 用**挂载**而不是 COPY 进镜像：
+      #   ① 它是配置而非代码，改站点地址/端口不该需要重建镜像（重建要跑一遍 Go 编译，
+      #      在这台经济型实例上要十几分钟）；
+      #   ② 挂载后可直接 `docker compose exec caddy caddy reload --config /etc/caddy/Caddyfile`
+      #      热加载，证书与连接不断。
+      # ⚠ 别删这一行：缺了它 Caddy 会退回默认配置（只在 :80 上返回 hello），
+      #   日志里表现为 “no automatic HTTPS will be applied”，且不会去申请任何证书。
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # 证书与 ACME 账户：必须持久化，否则每次重建都重新签发，很快撞上 LE 限额
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - frontend
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:
