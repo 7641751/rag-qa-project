@@ -16,12 +16,24 @@ FastAPI 以 SSE 流式吐出推理步骤与答案 token，React 前端渲染 Mar
 [![CI](https://github.com/<owner>/<repo>/actions/workflows/ci.yml/badge.svg)](https://github.com/<owner>/<repo>/actions/workflows/ci.yml)
 -->
 
+**线上地址：<http://47.114.103.158:8080>**（可直接注册使用；Docker Compose 全栈部署）
+
 | | |
 |---|---|
 | 端点 | 12 个（含 2 个 SSE 流） |
-| 测试 | 后端 262 例（全离线）/ 前端 148 例，2026-09-22 实测 |
+| 测试 | 后端 265 例（全离线）/ 前端 148 例，2026-09-23 实测 |
+| 公网延迟 | 首 token 延迟 **p50 1.60s / p95 2.44s**，首个推理步骤 0.33s 可见，见「[首 token 延迟](#首-token-延迟ttft)」 |
 | CI | GitHub Actions：push / PR 自动跑 `pytest` + `tsc --noEmit` + `vitest` + `vite build`（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)） |
 | 检索评估 | 23 条标注 query 的四配置离线对照，见「[检索评估](#检索评估)」 |
+
+![推理步骤与流式作答](docs/screenshots/02-chat-steps.png)
+
+<sub>**推理步骤实时可见**（检索 · 召回 4 段 → 评分 · 保留 4 段相关 → 生成 · 开始作答），
+答案逐字流式输出并标注 `【资料N】` 出处，底部是来源芯片。</sub>
+
+| 登录 / 注册 | 知识库管理 | 流式作答中 |
+|---|---|---|
+| ![登录](docs/screenshots/01-login.png) | ![知识库](docs/screenshots/04-knowledge-base.png) | ![流式](docs/screenshots/03-chat-streaming.png) |
 
 ---
 
@@ -169,6 +181,7 @@ rag_qa_project/                      ← 唯一 Python 源根（见「开发约�
 │
 ├── docs/
 │   ├── api/                         # README.md（契约）/ openapi.yaml / sse-example.txt / kb-sse-example.txt
+│   ├── screenshots/                 # README 用的 4 张实拍图（登录 / 推理步骤 / 流式 / 知识库）
 │   ├── examples/sse_upload_demo.py  # SSE 上传最小教学 demo（不碰 LangChain，可单独跑）
 │   └── superpowers/                 # 6 篇设计 spec + 8 篇实施 plan（P1→P4 + 部署 + 简历化改进）
 │
@@ -732,6 +745,11 @@ P3 之前的旧上传件没有 `user_id`，必须先用 `scripts/migrate_kb_user
 
 **③ 缓存不可达时，每次提问在 SSE 响应头之前同步白等 3 秒**（本机实测，2026-09-22）。
 
+> ✅ **公网部署没有这个问题**（2026-09-23 复测）：compose 内 Redis 用服务名互访，可达；
+> 公网首事件 p50 = 0.33s，与本机「绕开 Redis」的 0.25s 基本一致。
+> 所以这是**本机 `.env` 配置**问题（`REDIS_URL` 指向一台不在线的虚拟机），不是代码缺陷 ——
+> 但下面这条**设计层面的观察**依然成立：缓存不可达时的 3 秒会落在响应头之前。
+
 - **现象**：`POST /api/chat/stream` 的 **200 响应头要 3073ms 才到达**。
   对照 —— `GET /api/health` 28ms、`GET /api/auth/me`（同样走 MySQL）19ms；
   而**进程内**直接跑图、跑到第一个 `update` 只要 **281ms**。
@@ -819,20 +837,24 @@ uv run python scripts/measure_ttft.py --n 3             # 每条查询重复 3 �
 uv run python scripts/measure_ttft.py --base-url http://<IP>:8080   # 量公网真实延迟
 ```
 
-**实测**（本机，5 条查询，Redis 按「已知问题 ③」绕开后测得）：
+**实测**（5 条查询，`--n 1`）：
 
-| 指标 | p50 | p95 |
+| 指标 | 公网（`http://47.114.103.158:8080`） | 本机（Redis 已绕开） |
 |---|---|---|
-| 首 token 延迟（TTFT） | **1.71s** | 2.10s |
-| 首事件延迟（第一个 `step` 帧，即「检索」开始可见） | **0.25s** | — |
-| 端到端总耗时 | 5.00s | 5.04s |
+| 首 token 延迟（TTFT）　p50 / p95 | **1.60s** / 2.44s | 1.71s / 2.10s |
+| 首事件延迟（第一个 `step` 帧，「检索」开始可见） | **0.33s** | 0.25s |
+| 端到端总耗时　p50 / p95 | **4.70s** / 6.11s | 5.00s / 5.04s |
+| 兜底率（`grounded=false`） | 0/5 | 0/5 |
 
-拆解：TTFT ≈ `检索 + 评分（首事件，0.25s）` + `生成首个 token（~1.4s，取决于 DeepSeek 首包）`。
-所以**检索根本不是瓶颈** —— 想压 TTFT 应该先动生成侧或缓存侧，而不是加大 `top_k`。
+**拆解**：TTFT ≈ `检索 + 评分`（首事件，**0.33s**）+ `生成首个 token`（≈1.3s，取决于 DeepSeek 首包）。
+所以**检索根本不是 TTFT 的瓶颈** —— 想压首 token 延迟应该动生成侧或缓存侧，而不是加大 `top_k`。
+公网比本机只多 ~80ms，说明 nginx 反代 + 跨网往返的开销可以忽略（`X-Accel-Buffering: no` 确实生效，
+否则 SSE 会被 nginx 憋成一次性输出，TTFT 会跳到总耗时量级）。
 
-> ⚠️ **这个 1.71s 是在绕开 Redis 的条件下测的**，不是默认配置的表现。
-> 默认配置（`REDIS_URL` 指向不可达地址）下同一脚本实测 TTFT p50 = 4.83s、首事件 3.40s。
-> 两者的差值就是「已知问题 ③」，详见那一节。
+> ⚠️ **本机那列是「绕开 Redis」后测的**，不是默认配置的表现。
+> 本机默认配置（`REDIS_URL` 指向不可达地址）下同一脚本实测 TTFT p50 = 4.83s、首事件 3.40s
+> —— 差值就是「已知问题 ③」。**公网部署没有这个问题**（compose 内的 Redis 服务名可达），
+> 它的首事件 0.33s 与本机绕开 Redis 的 0.25s 基本一致。
 
 ---
 
