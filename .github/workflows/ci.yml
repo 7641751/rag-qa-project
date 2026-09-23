@@ -17,9 +17,11 @@ jobs:
     name: 后端（pytest，全离线）
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # action 版本跟随 Node 运行时：v4/v5 跑在 Node 20 上，GitHub 已宣布弃用并强制
+      # 改用 Node 24（实测会打出一条 deprecation annotation）。升到当前大版本消除它。
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           # 与 pyproject.toml 的 requires-python = ">=3.14" 一致
           python-version: '3.14'
@@ -51,9 +53,9 @@ jobs:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: npm
