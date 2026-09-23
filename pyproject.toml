@@ -18,12 +18,10 @@ requires-python = ">=3.14"
 dependencies = [
     "aiomysql>=0.3.2",
     "aiosqlite>=0.22.1",
-    "asyncpg>=0.31.0",
     "bcrypt>=5.0.0",
     "chromadb>=0.5.0",
     "cryptography>=50.0.0",
     "dashscope>=1.26.7",
-    "faiss-cpu>=1.7.0",
     "fastapi[standard]>=0.141.1",
     "grandalf>=0.8",
     "jieba>=0.42.1",
@@ -51,6 +49,14 @@ dev = [
     "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
 ]
+
+# ⚠ 2026-09-23 移除的两个依赖（原先被误列为正式依赖，全仓库零引用）：
+#   faiss-cpu —— 向量检索用的是 Chroma，没有任何 .py import faiss；
+#                它还是 30MB 级的重包，白占 Docker 镜像体积。
+#   asyncpg   —— PostgreSQL 驱动，而本项目用的是 MySQL（aiomysql）。
+#   移除后 pyproject 与 requirements.txt 的运行时依赖集合才真正一致，
+#   由 tests/test_deps_manifest.py 钉住（否则 CI/Docker 装的是 requirements，
+#   本地装的是 pyproject，漂移只会在 CI 上炸、本地永远复现不了）。
 
 # ⚠ 刻意**没有**声明的两个依赖（原先被误列为正式依赖）：
 #   sentence-transformers / langchain-huggingface

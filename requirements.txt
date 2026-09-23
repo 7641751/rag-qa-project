@@ -28,3 +28,13 @@ uvicorn[standard]>=0.30      # 运行 ASGI 用（非 import，PyCharm 不告警�
 # ↓ ingest.py 的 DashScopeEmbeddings 来自 langchain-community（若那里也报，一并加）
 langchain-community>=0.3
 dashscope>=1.20
+
+# ↓ 2026-09-23 补齐：以下 7 项在 pyproject.toml 里声明了，本文件却漏了 —— 而 CI 与 Docker
+#   都从**本文件**安装，于是 CI 首跑就红在 `ModuleNotFoundError: No module named 'jieba'`
+#   （本地永远复现不了，因为本地走 uv sync 装的是 pyproject）。
+#   现由 tests/test_deps_manifest.py 钉住「pyproject 的运行时依赖必须都在这里」。
+jieba>=0.42.1                 # eval_retrieval.py 的 BM25 中文分词（ASCII 标识符自己切，CJK 段交给 jieba）
+rank-bm25>=0.2.2              # 无直接 import，但 langchain_community.BM25Retriever 在运行时会要求它
+grandalf>=0.8                 # graph.py 的 print_ascii_graph()（即 run.py --graph 的 ASCII 工作流图）
+cryptography>=50.0.0          # dashscope 硬依赖（其 api_entities/encryption.py 在 import 期就用到）
+pydantic>=2.13.4              # 项目大量使用 pydantic v2 特性；虽是 fastapi 的传递依赖，显式钉住更稳
