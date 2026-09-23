@@ -12,16 +12,14 @@ FastAPI 以 SSE 流式吐出推理步骤与答案 token，React 前端渲染 Mar
 > **接口契约的唯一真相源是 [`docs/api/README.md`](docs/api/README.md) + [`docs/api/openapi.yaml`](docs/api/openapi.yaml)。**
 > 要增删字段或事件类型：**先改契约，再改后端实现与前端 `types.ts` / `client.ts`**，保持三者一致。
 
-<!-- CI 徽章：创建独立仓库后取消注释并把 <owner>/<repo> 换成实际值
-[![CI](https://github.com/<owner>/<repo>/actions/workflows/ci.yml/badge.svg)](https://github.com/<owner>/<repo>/actions/workflows/ci.yml)
--->
+[![CI](https://github.com/7641751/rag-qa-project/actions/workflows/ci.yml/badge.svg)](https://github.com/7641751/rag-qa-project/actions/workflows/ci.yml)
 
 **线上地址：<http://47.114.103.158:8080>**（可直接注册使用；Docker Compose 全栈部署）
 
 | | |
 |---|---|
 | 端点 | 12 个（含 2 个 SSE 流） |
-| 测试 | 后端 265 例（全离线）/ 前端 148 例，2026-09-23 实测 |
+| 测试 | 后端 272 例（全离线）/ 前端 148 例，2026-09-23 实测 |
 | 公网延迟 | 首 token 延迟 **p50 1.60s / p95 2.44s**，首个推理步骤 0.33s 可见，见「[首 token 延迟](#首-token-延迟ttft)」 |
 | CI | GitHub Actions：push / PR 自动跑 `pytest` + `tsc --noEmit` + `vitest` + `vite build`（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)） |
 | 检索评估 | 23 条标注 query 的四配置离线对照，见「[检索评估](#检索评估)」 |
@@ -52,7 +50,7 @@ FastAPI 以 SSE 流式吐出推理步骤与答案 token，React 前端渲染 Mar
 | 前端 | React 18 + Vite 5 + TypeScript 5.5 + Tailwind 3 | `react-markdown` + `highlight.js` + `katex` 渲染答案，`fetch` + `ReadableStream` 消费 SSE |
 | 可观测 | LangSmith | `.env` 里 `LANGSMITH_TRACING=true` 即自动上报完整调用树与 token 消耗 |
 | 部署 | Docker Compose | MySQL + Redis + backend + frontend（nginx 反代 `/api` 与 `/docs`，两个 SSE 端点均已关缓冲） |
-| 测试 | pytest（后端）/ vitest（前端） | **后端 262 例 / 前端 148 例**，全部离线跑，零 API 额度（数量见「测试」，按需重新生成） |
+| 测试 | pytest（后端）/ vitest（前端） | **后端 272 例 / 前端 148 例**，全部离线跑，零 API 额度（数量见「测试」，按需重新生成） |
 | 评估 | 自建检索评估脚本 | 23 条标注 query 的四配置对照（recall / MRR / hit@1 / p50-p95），见「检索评估」 |
 
 ---
@@ -185,7 +183,7 @@ rag_qa_project/                      ← 唯一 Python 源根（见「开发约�
 │   ├── examples/sse_upload_demo.py  # SSE 上传最小教学 demo（不碰 LangChain，可单独跑）
 │   └── superpowers/                 # 6 篇设计 spec + 8 篇实施 plan（P1→P4 + 部署 + 简历化改进）
 │
-└── tests/                           # 25 个文件 / 262 例，全部离线（DI 注入 Fake 模型与向量库）
+└── tests/                           # 26 个文件 / 272 例，全部离线（DI 注入 Fake 模型与向量库）
     └── fixtures/big_sample.md       # 「重复 chunk」分析的样本（非生产数据）
 ```
 └── tests/
@@ -547,7 +545,7 @@ python scripts/migrate_kb_user_id.py --dry-run   # 再跑应为 0 段待迁移�
 ## 测试
 
 ```bash
-python -m pytest tests -v          # 257 passed, 1 skipped, 4 deselected，约 20 秒
+python -m pytest tests -v          # 267 passed, 1 skipped, 4 deselected，约 20 秒
 ```
 
 ```bash
@@ -684,7 +682,7 @@ f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"   # 空行�
 **Q5：怎么不花 API 额度做回归测试？**
 见「测试」一节。两个注入点是 `build_graph(model=..., vectorstore=..., checkpointer=...)`
 和 `monkeypatch backend.tools.upload_function_tools.get_vectorstore`，
-262 个后端用例（257 通过 + 1 有意 skip + 4 在线用例排除）全部离线跑通。
+272 个后端用例（267 通过 + 1 有意 skip + 4 在线用例排除）全部离线跑通。
 
 **Q6：换其他 LLM / 其他向量库？**
 `graph.py` 的 `get_model()` / `get_vectorstore()` 是仅有的两处基础设施绑定，替换它们即可
