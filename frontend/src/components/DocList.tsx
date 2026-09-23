@@ -1,7 +1,16 @@
 import type { KbBuiltinSummary, KbDocument } from '../api/types';
+import { Button } from '../ui/Button';
+import { IconButton } from '../ui/IconButton';
+import { errorBoxCls } from '../ui/cls';
+import { IconRefresh, IconTrash } from '../ui/icons';
 
 /** builtin 摘要行（可选）+ 上传文档列表 + 删除 + 错误横幅。
- *  builtin 缺失时不渲染摘要行（契约 §4.5：整个对象可选）。 */
+ *  builtin 缺失时不渲染摘要行（契约 §4.5：整个对象可选）。
+ *
+ *  「刷新」与「删除」改用 ui/ 基元（Button / IconButton）：这里是全站最后两处
+ *  自成一体的控件（手写的蓝色下划线链接 + 裸 🗑 emoji），现在与 Header、抽屉关闭键
+ *  共用同一套 hover / 焦点环 / 危险色，风格改一次只动 ui/cls.ts。
+ */
 export function DocList({ documents, builtin, loading, error, deleteError, onRefresh, onDelete }: {
   documents: KbDocument[];
   builtin?: KbBuiltinSummary;
@@ -13,51 +22,53 @@ export function DocList({ documents, builtin, loading, error, deleteError, onRef
 }) {
   return (
     <section className="mt-4">
-      <div className="mb-2 flex items-center justify-between">
-        <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-500">我的文档</h3>
-        <button onClick={onRefresh} className="text-xs text-blue-600 hover:underline">刷新</button>
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <h3 className="text-xs font-semibold tracking-wide text-gray-600">我的文档</h3>
+        <Button variant="ghost" size="sm" onClick={onRefresh} title="重新拉取文档列表">
+          <IconRefresh size={12} />
+          刷新
+        </Button>
       </div>
 
       {builtin && (
-        <p className="mb-2 rounded bg-gray-50 px-2 py-1 text-[11px] text-gray-500" data-testid="builtin-summary">
+        <p className="mb-2 rounded-md bg-gray-50 px-2 py-1 text-[11px] text-gray-600" data-testid="builtin-summary">
           预置文档 {builtin.docs} 篇 / {builtin.chunks} 段（只读）
         </p>
       )}
 
-      {error && (
-        <p className="mb-2 rounded bg-red-50 px-2 py-1 text-[11px] text-red-600">列表加载失败：{error}</p>
-      )}
-      {deleteError && (
-        <p className="mb-2 rounded bg-red-50 px-2 py-1 text-[11px] text-red-600">删除失败：{deleteError}</p>
-      )}
+      {/* 错误一律 role="alert"：抽屉可能刚打开、焦点还在别处，只让文字变红
+          等于「失败只对看得见的人可见」。 */}
+      {error && <p role="alert" className={`mb-2 ${errorBoxCls}`}>列表加载失败：{error}</p>}
+      {deleteError && <p role="alert" className={`mb-2 ${errorBoxCls}`}>删除失败：{deleteError}</p>}
 
       {loading && documents.length === 0 ? (
-        <p className="text-xs text-gray-400">加载中…</p>
+        <p className="text-xs text-gray-500">加载中…</p>
       ) : documents.length === 0 ? (
-        <p className="text-xs text-gray-400">还没有上传任何文档</p>
+        <p className="text-xs text-gray-500">还没有上传任何文档</p>
       ) : (
         <ul className="space-y-1.5">
           {documents.map(d => (
             <li
               key={d.doc_id}
-              className="flex items-center justify-between gap-2 rounded-md border border-orange-100 bg-orange-50/50 px-2 py-1.5"
+              className="flex items-center justify-between gap-2 rounded-lg border border-orange-100 bg-orange-50/40 px-2.5 py-1.5"
             >
               <div className="min-w-0">
                 <p className="truncate text-xs font-medium text-gray-700" title={d.title ?? d.filename}>
                   {d.title ?? d.filename}
                 </p>
-                <p className="text-[11px] text-gray-400">
+                <p className="text-[11px] text-gray-500">
                   {d.chunks} 段
                   {typeof d.size_bytes === 'number' ? ` · ${formatBytes(d.size_bytes)}` : ''}
                   {' · '}
                   {formatDate(d.uploaded_at)}
                 </p>
               </div>
-              <button
-                onClick={() => onDelete(d.doc_id)}
+              <IconButton
                 aria-label={`删除 ${d.filename}`}
-                className="shrink-0 rounded px-1.5 py-0.5 text-xs text-gray-400 hover:bg-red-50 hover:text-red-500"
-              >🗑</button>
+                title={`删除 ${d.filename}`}
+                tone="danger"
+                onClick={() => onDelete(d.doc_id)}
+              ><IconTrash size={12} /></IconButton>
             </li>
           ))}
         </ul>

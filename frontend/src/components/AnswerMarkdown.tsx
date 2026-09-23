@@ -1,11 +1,14 @@
+import { memo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
-import rehypeHighlight from 'rehype-highlight';
 import 'katex/dist/katex.min.css';
+// 代码高亮走自建的最小插件（只注册 14 种语言），原因见该文件的顶部注释：
+// rehype-highlight 会静态引入 lowlight 的 common（37 种），传 languages 只会**加**不会**减**。
+import { rehypeHighlightSubset } from '../markdown/highlightSubset';
 
-/** 答案 Markdown 渲染：GFM 表格 + LaTeX 数学公式（KaTeX）+ 代码高亮。
+/** 答案 Markdown 渲染：GFM 表格 + LaTeX 数学公式（KaTeX）+ 代码高亮（14 种语言子集）。
  *
  * 为什么需要 remark-math + rehype-katex：模型回答数学类问题时会输出 `$V$`、
  * `$\mathbb{R}$`、`$+ : V \times V \to V$` 这类 LaTeX 记号，react-markdown 默认
@@ -17,8 +20,12 @@ import 'katex/dist/katex.min.css';
  *   的公式才会触发 KaTeX 降级，此时 errorColor 把它渲染成灰色而非刺眼的红。
  *
  * 另：`$$...$$` 只有当 `$$` **独占行**时才走 display（居中放大）；与内容同一行时按 inline 渲染。
+ *
+ * memo 的收益点：markdown → LaTeX → 代码高亮这三步解析是全前端最贵的一次渲染。
+ * 「来源芯片到达」「grounded 由 undefined 变 false」都会让 MessageBubble 重渲染，
+ * 而那时 answer 文本并没有变 —— 按 text 比较即可整段跳过解析。
  */
-export function AnswerMarkdown({ text }: { text: string }) {
+export const AnswerMarkdown = memo(function AnswerMarkdown({ text }: { text: string }) {
   return (
     <div className="prose prose-sm max-w-none break-words">
       <ReactMarkdown
@@ -27,11 +34,11 @@ export function AnswerMarkdown({ text }: { text: string }) {
           // strict:false 让不支持的 LaTeX 命令降级而不是报错；errorColor 把“已闭合但非法”
           // 的公式渲染成灰色而非刺眼的红（未闭合的公式压根不会进 KaTeX，见上方注释）
           [rehypeKatex, { strict: false, throwOnError: false, errorColor: '#6b7280' }],
-          rehypeHighlight,
+          rehypeHighlightSubset,
         ]}
       >
         {text}
       </ReactMarkdown>
     </div>
   );
-}
+});

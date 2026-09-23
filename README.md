@@ -47,7 +47,7 @@ FastAPI 以 SSE 流式吐出推理步骤与答案 token，React 前端渲染 Mar
 | 关系库 | MySQL 8 + SQLAlchemy 2.0 async（aiomysql） | 用户 / 会话归属（`conversations`）/ 问答事件（`qa_events`）；`mysql_database_url` 为空时快速失败并点名该变量 |
 | 缓存 / MQ | Redis 7（**可选依赖**） | cache-aside 读缓存 + Streams 事件流（消费组 / `event_id` 幂等 / 死信）；`RAGQA_REDIS_CACHE_ENABLED=false` 一键回滚，未配 Redis 则整体旁路 |
 | 后端 | FastAPI + uvicorn | **12 个端点**，其中 2 个是 SSE 流；`/api/health` 为公开就绪探针 |
-| 前端 | React 18 + Vite 5 + TypeScript 5.5 + Tailwind 3 | `react-markdown` + `highlight.js` + `katex` 渲染答案，`fetch` + `ReadableStream` 消费 SSE |
+| 前端 | React 18 + Vite 5 + TypeScript 5.5 + Tailwind 3 | `react-markdown` + `katex` 渲染答案 + 自建最小高亮插件（14 种语言）；`fetch` + `ReadableStream` 消费 SSE；设计 token 与控件基元收敛在 `src/ui/`，详见「[前端工程](#前端工程视觉--响应式--无障碍--性能)」 |
 | 可观测 | LangSmith | `.env` 里 `LANGSMITH_TRACING=true` 即自动上报完整调用树与 token 消耗 |
 | 部署 | Docker Compose | MySQL + Redis + backend + frontend（nginx 反代 `/api` 与 `/docs`，两个 SSE 端点均已关缓冲） |
 | 测试 | pytest（后端）/ vitest（前端） | **后端 272 例 / 前端 148 例**，全部离线跑，零 API 额度（数量见「测试」，按需重新生成） |
@@ -159,10 +159,14 @@ rag_qa_project/                      ← 唯一 Python 源根（见「开发约�
 │
 ├── frontend/
 │   ├── src/api/                     # client.ts（SSE 解析）+ types.ts（对齐 openapi.yaml）+ tokenStore.ts
+│   ├── src/ui/                      # 设计 token 与控件基元：cls.ts（按钮 5 档语义 / 输入框 /
+│   │                                # 错误框 / 焦点环）、Button、IconButton、icons.tsx（内联 SVG）
 │   ├── src/components/              # ChatWindow / MessageBubble / StepTrace / SourceChips /
 │   │                                # AnswerMarkdown / Composer / Header / Sidebar /
 │   │                                # ConversationItem / LoginPage / ConfirmDialog /
-│   │                                # KnowledgeBaseDrawer / UploadZone / DocList
+│   │                                # KnowledgeBaseDrawer（懒加载入口 KnowledgeBasePanel）/
+│   │                                # UploadZone / DocList
+│   ├── src/markdown/                # highlightSubset.ts：只注册 14 种语言的最小 rehype 高亮插件
 │   ├── src/hooks/                   # useChat / useThreadId / useKnowledgeBase /
 │   │                                # useConversations / useSidebar / useAuth
 │   ├── src/test/                    # vitest（jsdom）14 个测试文件 / 148 例
@@ -552,6 +556,7 @@ python -m pytest tests -v          # 267 passed, 1 skipped, 4 deselected，约 2
 cd frontend
 npm run test                       # 148 passed（14 个文件，jsdom），约 4 秒
 npm run build                      # tsc --noEmit + vite build（类型检查不过就不出包）
+                                   # 产物：主包 685.49 kB（gzip 212.63）+ 懒加载 5.71 kB + CSS 71.08 kB
 ```
 
 > **那 1 个 skip 是有意为之，不是掩盖失败**：`test_auth_service.py:93` 依赖 MySQL 的
@@ -570,6 +575,78 @@ npm run build                      # tsc --noEmit + vite build（类型检查不
   用真库而非手写 where 求值器，是因为隔离的成败取决于 Chroma 对 `$and`/`$or` 的真实语义。
 - `test_kb_upload.py`：`DeterministicFakeEmbedding` 替换 DashScope、`tmp_path` 里的独立 Chroma 替换真实库、
   `monkeypatch settings.uploads_dir` 隔离落盘目录，用 `TestClient` 跑完整 SSE 时序。
+
+---
+
+## 前端工程（视觉 / 响应式 / 无障碍 / 性能）
+
+一次系统化打磨。**功能、`data-testid`、行为契约一律未动** —— 148 例前端测试改动前后全绿，
+改动全部落在「外观、可访问性、渲染开销」三类上。
+
+### 设计 token 收敛到一处
+
+`src/ui/` 是唯一的控件与样式来源，调用处只表达语义：
+
+| 文件 | 作用 |
+|---|---|
+| `ui/cls.ts` | 按钮 5 档语义（`primary` / `ghost` / `danger` / `dangerGhost` / `dark`）、输入框、错误框、焦点环 |
+| `ui/Button.tsx` | 全站唯一按钮：禁用态 / loading 旋转 / 防双击 / 焦点环在此统一处理，`forwardRef` 供确认框落初始焦点 |
+| `ui/IconButton.tsx` | 纯图标按钮：`aria-label` **必填**（不给就只剩一个「按钮」），点击区不小于 22px |
+| `ui/icons.tsx` | 内联 SVG 图标，替换原先散落的 ✎ 🗑 ✕ ⬆ 🔍 emoji（emoji 渲染随平台字体而异，且对读屏是噪音） |
+
+> 例外：`📚 知识库` 保留 emoji —— 测试用 `getByText('📚 知识库')` 精确匹配，**测试契约优先**。
+
+### 响应式
+
+- 侧栏在 `<md` 变成**覆盖层抽屉**（`fixed` + 遮罩 + 滑入），不再把聊天区挤到只剩几十像素；`md+` 仍是并列两列
+- 折叠状态持久化到 `localStorage`，且**窄屏默认折叠**（`matchMedia` 探测，jsdom 下 `try/catch` 兜底）
+- 顶栏三个带文字的按钮在 `<sm` 收起文字只留图标，**并各自补上 `aria-label`**：
+  收起文字会让可访问名变空（`display:none` 不计入 accessible name），这是最容易漏的一处
+- 标题 `truncate` + `min-w-0`：窄屏先压缩标题，而不是把右侧按钮挤出屏幕
+
+### 无障碍
+
+- 消息区 `role="log"` + `aria-live="polite"`：流式答案按序朗读，但不过度打断
+- 上传区原先是「纯 `div` + `onClick`」（Tab 聚焦不到、回车无效，**对键盘用户等于功能不存在**）→
+  补 `role="button"` + `tabIndex` + 回车/空格；进度条补 `role="progressbar"` 与 `aria-valuenow`
+  （无法算比例时**不设** `aria-valuenow`，即 ARIA 的「不定进度」）
+- 所有错误提示 `role="alert"`；确认框保持既有的安全默认（初始焦点落在「取消」）
+- 图标按钮强制 `aria-label`；当前会话加 `aria-current`
+- 对比度：散落的 `text-gray-400`（白底约 2.9:1，不达标）统一提到 `gray-500/600`
+- 尊重 `prefers-reduced-motion`：CSS 关掉动画与过渡，自动滚动退化为 `auto` 而非 `smooth`
+
+### 性能（实测，非估算）
+
+| 指标 | 优化前 | 优化后 | 变化 |
+|---|---|---|---|
+| 主包 JS | 784.65 kB | **685.49 kB** | **−99.2 kB（−12.6%）** |
+| 主包 JS（gzip） | 241.32 kB | **212.63 kB** | −28.7 kB（−11.9%） |
+| CSS | 66.46 kB | 71.08 kB | +4.6 kB（新增的控件与焦点环样式） |
+
+> 测量方式：`git worktree` 检出优化前的提交，与当前实现**在同一台机器、同一份 node_modules 下各跑一次**
+> `vite build`，对比产物。上面的「优化前」就是实测值，不是估算。
+
+做了四件事，其中只有第一件能减包：
+
+1. **代码高亮只注册 14 种语言**（那 −99 kB 的主要来源）。这里踩了一个有意思的坑：
+   `rehype-highlight` 把 lowlight 的 `common`（37 种语言）**静态引入**，并写在
+   `settings.languages || common` 这个**活表达式**里 —— 打包器无法摇掉一个被引用的对象。
+   所以「传 `languages` 做按需注册」的真实语义是「在 37 种之上再加十几种」：
+   实测主包从 784.65 kB **涨到** 835.62 kB，是**负优化**。
+   正解是自建 40 行的 rehype 插件（`src/markdown/highlightSubset.ts`）直接 `createLowlight(子集)`：
+   lowlight 声明了 `sideEffects: false`，未被引用的 `lib/common.js`（37 种）与 `lib/all.js`（约 190 种）
+   才会被摇掉。顺带把 lowlight 实例提到**模块级** —— 原先的写法每次渲染都重建实例、重新注册语法。
+2. **知识库面板懒加载**：抽屉 + 上传区 + 文档列表独立成 5.71 kB 的 chunk，首屏不解析
+   （它是 App 里唯一「不打开就永远用不到」的大块 UI）
+3. **`React.memo` 打在最贵的三处**：消息气泡、推理步骤/来源芯片、答案 Markdown 渲染。
+   流式时每个 token 都会重渲染整个列表，而 `updateLastAssistant` 只替换最后一条 ——
+   老气泡 props 未变即整段跳过，`Markdown → LaTeX → 高亮` 这三步解析不再重跑
+4. **自动滚动节流**：token 到达频率高于刷新率，逐次 `scrollIntoView({behavior:'smooth'})`
+   会让平滑动画在同一帧反复排队。改为 90ms 节流 + **尾沿触发**（最后一个 token 之后仍补滚一次，
+   否则答案末尾会停在视口外），且只在用户本就贴近底部时才滚（往上翻历史不再被拽回底部）
+
+> 第 2–4 条减的是**主线程与渲染开销**，在体积指标上完全看不出来 —— 想验证它们得看首 token 出现后的
+> 掉帧情况，而不是看构建输出。把不能证明的收益说成收益，比不做优化更糟。
 
 ---
 

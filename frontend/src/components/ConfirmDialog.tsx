@@ -1,4 +1,6 @@
 import { useEffect, useRef } from 'react';
+import { Button } from '../ui/Button';
+import { errorBoxCls } from '../ui/cls';
 
 export interface ConfirmDialogProps {
   open: boolean;
@@ -50,32 +52,36 @@ export function ConfirmDialog({
         onClick={() => { if (!busy) onCancel(); }}
       />
       <div
-        role="dialog" aria-modal="true" aria-labelledby="confirm-dialog-title"
+        role="dialog" aria-modal="true"
+        aria-labelledby="confirm-dialog-title" aria-describedby="confirm-dialog-body"
         data-testid="confirm-dialog"
         className="dialog-pop relative w-full max-w-sm rounded-lg bg-white p-5 shadow-xl"
       >
         <h2 id="confirm-dialog-title" className="text-sm font-semibold text-gray-900">{title}</h2>
-        <p className="mt-2 text-xs leading-relaxed text-gray-600">{body}</p>
+        <p id="confirm-dialog-body" className="mt-2 text-xs leading-relaxed text-gray-600">{body}</p>
         {error && (
           <p
             data-testid="confirm-error"
-            className="mt-3 rounded-md border border-red-200 bg-red-50 px-2 py-1.5 text-xs leading-relaxed text-red-700"
+            role="alert"
+            className={`mt-3 ${errorBoxCls}`}
           >{error}</p>
         )}
         <div className="mt-5 flex justify-end gap-2">
-          <button
+          <Button
             ref={cancelRef}
+            variant="ghost"
+            size="sm"
             data-testid="confirm-cancel"
             disabled={busy}
             onClick={onCancel}
-            className="rounded-md border px-3 py-1.5 text-xs text-gray-600 hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-50"
-          >{cancelLabel}</button>
-          <button
+          >{cancelLabel}</Button>
+          <Button
+            variant="danger"
+            size="sm"
             data-testid="confirm-ok"
-            disabled={busy}
+            loading={busy}
             onClick={onConfirm}
-            className="rounded-md bg-red-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-50"
-          >{busy ? busyLabel : confirmLabel}</button>
+          >{busy ? busyLabel : confirmLabel}</Button>
         </div>
       </div>
     </div>

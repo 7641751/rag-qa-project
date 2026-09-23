@@ -1,4 +1,7 @@
 import { useState } from 'react';
+import { Button } from '../ui/Button';
+import { errorBoxCls, inputCls } from '../ui/cls';
+import { IconRobot } from '../ui/icons';
 
 /**
  * 登录 / 注册页（spec §8.4）。
@@ -50,18 +53,22 @@ export function LoginPage({ onLogin, onRegister, error = null }: LoginPageProps)
   }
 
   const segCls = (active: boolean) =>
-    `rounded px-3 py-1.5 text-xs font-medium transition ${
+    `rounded px-3 py-1.5 text-xs font-medium transition focus-visible:outline-none ` +
+    `focus-visible:ring-2 focus-visible:ring-blue-500/70 ${
       active ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'
     }`;
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-gray-50 p-4">
+    <div className="flex min-h-screen items-center justify-center bg-gradient-to-b from-gray-50 to-gray-100 p-4">
       <form
         onSubmit={submit}
         data-testid="login-page"
-        className="w-full max-w-sm rounded-lg bg-white p-6 shadow-xl"
+        className="w-full max-w-sm rounded-xl border border-gray-100 bg-white p-7 shadow-xl"
       >
-        <h1 className="text-center text-base font-semibold text-gray-900">LangChain 智能问答</h1>
+        <h1 className="flex items-center justify-center gap-2 text-center text-base font-semibold text-gray-900">
+          <IconRobot size={20} className="text-blue-600" />
+          LangChain 智能问答
+        </h1>
 
         <div
           role="tablist"
@@ -82,17 +89,18 @@ export function LoginPage({ onLogin, onRegister, error = null }: LoginPageProps)
           >注册</button>
         </div>
 
-        <label className="mt-5 block text-xs text-gray-600" htmlFor="auth-username-input">用户名</label>
+        <label className="mt-5 block text-xs font-medium text-gray-600" htmlFor="auth-username-input">用户名</label>
         <input
           id="auth-username-input"
           data-testid="auth-username"
           autoComplete="username"
           value={username}
           onChange={e => setUsername(e.target.value)}
-          className="mt-1 w-full rounded-md border px-3 py-2 text-sm outline-none focus:border-gray-400"
+          aria-invalid={!!shownError}
+          className={`mt-1 w-full ${inputCls}`}
         />
 
-        <label className="mt-3 block text-xs text-gray-600" htmlFor="auth-password-input">密码</label>
+        <label className="mt-3 block text-xs font-medium text-gray-600" htmlFor="auth-password-input">密码</label>
         <input
           id="auth-password-input"
           data-testid="auth-password"
@@ -100,22 +108,27 @@ export function LoginPage({ onLogin, onRegister, error = null }: LoginPageProps)
           autoComplete={isLogin ? 'current-password' : 'new-password'}
           value={password}
           onChange={e => setPassword(e.target.value)}
-          className="mt-1 w-full rounded-md border px-3 py-2 text-sm outline-none focus:border-gray-400"
+          aria-invalid={!!shownError}
+          aria-describedby={shownError ? 'auth-error-text' : undefined}
+          className={`mt-1 w-full ${inputCls}`}
         />
 
         {shownError && (
           <p
+            id="auth-error-text"
             data-testid="auth-error"
-            className="mt-3 rounded-md border border-red-200 bg-red-50 px-2 py-1.5 text-xs leading-relaxed text-red-700"
+            role="alert"
+            className={`mt-3 ${errorBoxCls}`}
           >{shownError}</p>
         )}
 
-        <button
+        <Button
           type="submit"
+          variant="dark"
+          loading={busy}
           data-testid="auth-submit"
-          disabled={busy}
-          className="mt-5 w-full rounded-md bg-gray-900 px-3 py-2 text-sm font-medium text-white hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-50"
-        >{busy ? '处理中…' : (isLogin ? '登录' : '注册')}</button>
+          className="mt-5 w-full"
+        >{busy ? '处理中…' : (isLogin ? '登录' : '注册')}</Button>
       </form>
     </div>
   );

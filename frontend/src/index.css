@@ -2,6 +2,34 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ── 全局可访问性默认 ─────────────────────────────────────────────── */
+
+/* 键盘焦点：对没有单独写 focus-visible 工具类的元素兜底（按钮/输入框已在
+   ui/cls.ts 与组件里显式处理，这条是安全网而非主要实现） */
+:focus-visible {
+  outline: 2px solid rgb(59 130 246 / 0.6);
+  outline-offset: 2px;
+}
+
+/* 文本选中色：与主色一致，避免默认蓝紫与品牌色打架 */
+::selection {
+  background: rgb(191 219 254 / 0.7); /* blue-200 */
+}
+
+/* 滚动条：细一点、不抢戏（overflow-y 的两个长列表：侧栏与消息区） */
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-thumb { background: rgb(0 0 0 / 0.14); border-radius: 4px; }
+*::-webkit-scrollbar-thumb:hover { background: rgb(0 0 0 / 0.24); }
+*::-webkit-scrollbar-track { background: transparent; }
+
+/* 尊重「减少动态效果」系统偏好：动画与平滑滚动一律关掉（晕动症/前庭敏感用户） */
+@media (prefers-reduced-motion: reduce) {
+  .kb-drawer-panel,
+  .dialog-pop { animation: none; }
+  html { scroll-behavior: auto !important; }
+  *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
+}
+
 /* 知识库抽屉滑入：用原生 keyframes，不引额外动画依赖 */
 @keyframes kb-slide-in {
   from { transform: translateX(100%); }

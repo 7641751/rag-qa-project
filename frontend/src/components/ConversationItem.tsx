@@ -1,6 +1,8 @@
-import { useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import type { ConversationSummary } from '../api/types';
 import { RENAME_MAX_CHARS } from '../hooks/useConversations';
+import { IconButton } from '../ui/IconButton';
+import { IconPencil, IconTrash } from '../ui/icons';
 
 /** ISO 时间 → 相对时间。「刚刚 / N 分钟前 / N 小时前 / N 天前」；超 30 天直接给日期。
  *
@@ -32,8 +34,13 @@ export interface ConversationItemProps {
   error?: string | null;
 }
 
-/** 侧栏里的单条会话：标题 + 相对时间 + hover 出的 ✎ / 🗑。 */
-export function ConversationItem({
+/** 侧栏里的单条会话：标题 + 相对时间 + hover/键盘聚焦出的 ✎ / 🗑。
+ *
+ *  操作按钮的可见性用**状态**而非纯 CSS hover：jsdom 不实现 :hover，纯 CSS 的话
+ *  「hover 出按钮」这条行为就完全测不到（conversation-item.test.tsx 依赖此）。
+ *  当前项（active）常显，键盘用户 Tab 到该行时同样显示（无障碍兜底）。
+ */
+export const ConversationItem = memo(function ConversationItem({
   conv, active, onSelect, onRename, onDelete, error = null,
 }: ConversationItemProps) {
   const [hovered, setHovered] = useState(false);
@@ -74,8 +81,6 @@ export function ConversationItem({
     setLocalError(null);
   }
 
-  // 按钮可见性用**状态**而非纯 CSS hover：jsdom 不实现 :hover，纯 CSS 的话
-  // 「hover 出按钮」这条行为就完全测不到。当前项（active）常显，键盘用户也能 Tab 到。
   const showActions = hovered || active;
   // 本地校验提示优先：它针对「当前这次输入」，比上一次失败的旧错误更相关
   const shownError = localError ?? error;
@@ -87,6 +92,14 @@ export function ConversationItem({
         data-active={active ? 'true' : 'false'}
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}
+        onFocus={e => {
+          // 键盘可达性：hover 才出按钮的话，Tab 用户永远够不到 ✎/🗑。
+          // focus 进入本行（含标题按钮）即视同 hover；离开整行才收起。
+          if (e.currentTarget.contains(e.target)) setHovered(true);
+        }}
+        onBlur={e => {
+          if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setHovered(false);
+        }}
         className={`group flex items-center gap-1 rounded-md px-2 py-1.5 text-xs ${
           active ? 'bg-blue-50 text-gray-900' : 'text-gray-600 hover:bg-gray-100'
         }`}
@@ -110,32 +123,33 @@ export function ConversationItem({
             data-testid="conv-title"
             onClick={() => onSelect(conv.thread_id)}
             title={conv.title}
-            className="min-w-0 flex-1 truncate text-left"
+            // 当前会话：屏幕阅读器报「当前」而不是靠背景色暗示（颜色对读屏用户不可见）
+            aria-current={active ? 'true' : undefined}
+            className="min-w-0 flex-1 truncate text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/60"
           >{conv.title}</button>
         )}
 
         {!editing && (
-          <span data-testid="conv-time" className="shrink-0 text-[10px] text-gray-400">
+          <span data-testid="conv-time" className="shrink-0 text-[10px] text-gray-500">
             {relTime(conv.updated_at)}
           </span>
         )}
 
         {showActions && !editing && (
           <>
-            <button
-              type="button"
-              data-testid="rename-btn"
+            <IconButton
+              aria-label="重命名"
               title="重命名"
+              data-testid="rename-btn"
               onClick={startEdit}
-              className="shrink-0 rounded px-1 text-gray-400 hover:bg-gray-200 hover:text-gray-700"
-            >✎</button>
-            <button
-              type="button"
-              data-testid="delete-btn"
+            ><IconPencil size={12} /></IconButton>
+            <IconButton
+              aria-label="删除这个会话"
               title="删除这个会话"
+              tone="danger"
+              data-testid="delete-btn"
               onClick={() => onDelete(conv.thread_id)}
-              className="shrink-0 rounded px-1 text-gray-400 hover:bg-red-100 hover:text-red-600"
-            >🗑</button>
+            ><IconTrash size={12} /></IconButton>
           </>
         )}
       </div>
@@ -149,4 +163,4 @@ export function ConversationItem({
       )}
     </div>
   );
-}
+});

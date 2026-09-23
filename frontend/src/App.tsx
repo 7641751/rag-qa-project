@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react';
+import { Suspense, lazy, useCallback, useState } from 'react';
 import { useChat } from './hooks/useChat';
 import { useKnowledgeBase } from './hooks/useKnowledgeBase';
 import { useAuth } from './hooks/useAuth';
@@ -9,10 +9,13 @@ import { Sidebar } from './components/Sidebar';
 import { Header } from './components/Header';
 import { ChatWindow } from './components/ChatWindow';
 import { Composer } from './components/Composer';
-import { KnowledgeBaseDrawer } from './components/KnowledgeBaseDrawer';
-import { UploadZone } from './components/UploadZone';
-import { DocList } from './components/DocList';
 import { ConfirmDialog } from './components/ConfirmDialog';
+
+// 知识库面板按需加载：它是 App 里唯一「不打开就永远用不到」的大块 UI。
+// 首次点开「📚 知识库」时才下载这块代码（抽屉 + 上传区 + 文档列表），首屏少解析一截。
+// ⚠ 测试兼容点：app.test 用的是 `await waitFor(getByTestId('upload-zone'))` 重试式断言，
+//   动态 import 在下一个轮询周期即出现，不会红。
+const KnowledgeBasePanel = lazy(() => import('./components/KnowledgeBasePanel'));
 
 /** 鉴权门槛：loading → 校验中，anon → 登录页，authed → 主界面。 */
 export default function App() {
@@ -77,6 +80,13 @@ function AuthedApp({ onLogout, username }: AuthedAppProps) {
     : undefined;
   const deletingCurrent = pendingDelete !== null && pendingDelete === threadId;
 
+  // ConversationItem 是 memo 组件：传给它的回调若每次渲染都新建（内联箭头），
+  // memo 就永远失效。所以这里必须 useCallback。
+  const requestDelete = useCallback((id: string) => {
+    clearDeleteError();
+    setPendingDelete(id);
+  }, [clearDeleteError]);
+
   const confirmDelete = useCallback(async () => {
     const id = pendingDelete;
     if (!id) return;
@@ -112,7 +122,7 @@ function AuthedApp({ onLogout, username }: AuthedAppProps) {
         activeId={threadId}
         onSelect={switchTo}
         onRename={conv.rename}
-        onDelete={id => { clearDeleteError(); setPendingDelete(id); }}
+        onDelete={requestDelete}
         onRetry={conv.refresh}
       />
 
@@ -132,23 +142,11 @@ function AuthedApp({ onLogout, username }: AuthedAppProps) {
         <Composer streaming={streaming} onSend={send} onStop={abort} />
       </div>
 
-      <KnowledgeBaseDrawer open={kb.open} onClose={kb.closeKb}>
-        <UploadZone
-          uploads={kb.uploads}
-          onFiles={kb.addFiles}
-          onCancel={kb.cancelUpload}
-          onDismiss={kb.dismiss}
-        />
-        <DocList
-          documents={kb.documents}
-          builtin={kb.builtin}
-          loading={kb.loadingList}
-          error={kb.listError}
-          deleteError={kb.docError}
-          onRefresh={kb.refresh}
-          onDelete={kb.removeDoc}
-        />
-      </KnowledgeBaseDrawer>
+      {kb.open && (
+        <Suspense fallback={null}>
+          <KnowledgeBasePanel kb={kb} />
+        </Suspense>
+      )}
 
       <ConfirmDialog
         open={pendingDelete !== null}
