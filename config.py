@@ -18,8 +18,12 @@ PROJECT_DIR = Path(__file__).resolve().parent
 # pydantic-settings 的 env_file 只喂给 Settings 模型，**不会写进 os.environ**，
 # 而 DashScopeEmbeddings / ChatDeepSeek 是用 os.getenv 取 key 的 ——
 # 少了这一句，直接跑 uvicorn 时嵌入和 LLM 都会因为拿不到 key 而失败。
-def _find_env_file() -> Path | None:
-    """定位 .env：**由外向内**逐级回退，找到第一个存在的就用。
+def _find_env_file(src: Path | None = None) -> Path | None:
+    """定位 .env：**由外向内**逐级回退，找到第一个存在的就用。全项目**只此一处**。
+
+    `src` 默认取本文件（即 `PROJECT_DIR/config.py`）。显式可传是为了让测试能构造
+    各种目录层级（容器 / monorepo / 独立仓库）—— 否则「容器里不许 IndexError」
+    这条回归线只能靠真起一个容器来验。
 
     为什么是「由外向内」而不是「就近优先」：monorepo 布局下同时存在两个用途不同的 .env ——
       · `<monorepo 根>/.env`（两级之上）      本地开发用，含 RAGQA_MYSQL_DATABASE_URL / REDIS_URL
@@ -28,20 +32,25 @@ def _find_env_file() -> Path | None:
     所以**外层的开发配置**优先级更高。
 
     为什么必须逐级回退而不是写死一个：本项目已从 monorepo 抽成独立仓库，
-    此时 PROJECT_DIR 就是仓库根、`parent.parent` 会指到仓库外面去。
+    此时 PROJECT_DIR 就是仓库根、`parent.parent` 会指到仓库外面去（可能读到无关的 .env）。
     四个候选覆盖了全部已知布局：
-      ① RAGQA_ENV_FILE 显式指定（最高优先级，逃生舱）
+      ① RAGQA_ENV_FILE 显式指定（最高优先级，逃生舱）—— **不校验存在性**，由调用方自负
       ② PROJECT_DIR.parent.parent/.env   monorepo 布局（外层的开发配置）
       ③ PROJECT_DIR.parent/.env          中间层
       ④ PROJECT_DIR/.env                 独立仓库根 / docker 镜像内（PROJECT_DIR = /app）
     找不到就返回 None —— 此时全靠进程环境变量（docker compose 就是这种注入方式）。
+
+    容器安全：`/app/` 只有两层父目录，但 pathlib 在根目录上 `.parent` 返回**自身**
+    （不像 `parents[2]` 那样越界抛 IndexError），所以这里最坏只是找不到、不会崩。
+    这条是 2026-09-22 云部署事故（一提问就炸）的回归线，见 tests/test_ingest_env.py。
     """
+    base = (src or Path(__file__)).resolve().parent
     explicit = os.environ.get("RAGQA_ENV_FILE", "").strip()
     if explicit:
         return Path(explicit)
-    for candidate in (PROJECT_DIR.parent.parent / ".env",
-                      PROJECT_DIR.parent / ".env",
-                      PROJECT_DIR / ".env"):
+    for candidate in (base.parent.parent / ".env",
+                      base.parent / ".env",
+                      base / ".env"):
         if candidate.is_file():
             return candidate
     return None

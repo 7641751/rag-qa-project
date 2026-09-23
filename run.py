@@ -6,19 +6,20 @@
 """
 import argparse
 import asyncio
-import os
 import sys
-from pathlib import Path
+
+# ⚠ 与 ingest.py 同一条约束：config 必须排在任何 langchain / huggingface_hub 导入**之前**。
+#   它统一负责 ① load_dotenv（定位逻辑见 config._find_env_file）
+#             ② setdefault HF_ENDPOINT（晚于 huggingface_hub 导入就失效）。
+#   历史：本模块曾自带 `ROOT = Path(__file__).resolve().parents[2]` + load_dotenv ——
+#   monorepo 下那个路径恰好指对，但抽成独立仓库后会指到**仓库外面**（可能读到无关的
+#   .env 并覆盖真实配置），故统一收归 config。
+#   backend.app.* 仍在函数内惰性导入：--graph 模式不需要拉起整条重依赖链。
+from config import ENV_FILE  # noqa: F401  ENV_FILE 供 tests 断言「与 config 同一份」
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
-
-# 加载项目根 .env（DEEPSEEK_API_KEY 等）
-ROOT = Path(__file__).resolve().parents[2]
-from dotenv import load_dotenv
-load_dotenv(ROOT / ".env")
-os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
 
 def ask(question: str, mode: str = "normal"):

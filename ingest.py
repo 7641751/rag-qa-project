@@ -10,39 +10,21 @@ import re
 import sys
 from pathlib import Path
 
+# ⚠ config 必须排在任何 langchain / huggingface_hub 导入**之前**。它一次性负责两件事：
+#   ① load_dotenv：定位逻辑统一在 config._find_env_file()（容器 / monorepo / 独立仓库
+#      三种布局都认，且容器里不会 IndexError）—— 本模块**不再自带** .env 定位实现。
+#      历史：这里曾有一个写死 `parents[2]` 的 _repo_env_file，那是 2026-09-22 云部署
+#      「一提问就炸」事故的产物；抽成独立仓库后它会指到仓库外，故统一收归 config。
+#   ② setdefault HF_ENDPOINT —— 晚于 huggingface_hub 导入就失效了
+#      （huggingface_hub 会在首次导入时把 endpoint 固化），所以本模块不再重复设置。
+from config import ENV_FILE, settings  # noqa: F401  ENV_FILE 供 tests 断言「与 config 同一份」
 from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter, Language
-from dotenv import load_dotenv
-
-
-def _repo_env_file(src: Path) -> Path | None:
-    """项目根 .env = src 上方两层处的 .env；路径层级不足（容器内 /app/）时返回 None。
-
-    容器里代码在 /app/（只有两层父目录），直接 parents[2] 会 IndexError ——
-    本模块被 get_vectorstore() import，崩的代价是「一提问就炸」+ 健康检查静默
-    丢 kb_count（2026-09-22 云部署实测）。容器内没有 .env（.dockerignore 排除），
-    密钥全部由 compose 的环境变量注入，所以正确行为是跳过而不是崩。
-    """
-    try:
-        return src.resolve().parents[2] / ".env"
-    except IndexError:
-        return None
-
-
-_repo_env = _repo_env_file(Path(__file__))
-if _repo_env is not None:
-    load_dotenv(_repo_env)   # 项目根 .env（本地开发）
 
 # Windows 控制台 UTF-8 输出
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
-
-# 关键：HF 镜像必须在任何 langchain/chromadb/huggingface_hub 导入之前设置，
-# 否则 huggingface_hub 会把 ENDPOINT 固化为 huggingface.co 导致下载失败
-os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
-
-from config import settings
 
 
 def build_embeddings():
