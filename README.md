@@ -33,6 +33,14 @@ FastAPI 以 SSE 流式吐出推理步骤与答案 token，React 前端渲染 Mar
 |---|---|---|
 | ![登录](docs/screenshots/01-login.png) | ![知识库](docs/screenshots/04-knowledge-base.png) | ![流式](docs/screenshots/03-chat-streaming.png) |
 
+窄屏（390 × 844）—— 聊天区不再被 250px 侧栏挤没，侧栏改为覆盖层抽屉，顶栏收起文字只留图标：
+
+| 聊天区满宽 | 侧栏覆盖层抽屉 |
+|---|---|
+| ![窄屏聊天](docs/screenshots/05-mobile.png) | ![窄屏抽屉](docs/screenshots/06-mobile-drawer.png) |
+
+<sub>以上均为**线上地址的实机截图**（`http://47.114.103.158:8080`，Docker Compose 部署）。</sub>
+
 ---
 
 ## 技术栈
